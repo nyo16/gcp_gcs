@@ -1,0 +1,6 @@
+services:
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server:latest
+    command: -scheme http -host 0.0.0.0 -port 4443 -public-host localhost:4443
+    ports:
+      - "4443:4443"
