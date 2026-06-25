@@ -1,6 +1,13 @@
 defmodule GcpGcsTest do
   use ExUnit.Case, async: true
 
+  # function_exported?/3 does not auto-load; make sure the module is loaded
+  # regardless of test ordering.
+  setup_all do
+    Code.ensure_loaded!(GcpGcs)
+    :ok
+  end
+
   describe "public API surface" do
     test "delegates bucket operations" do
       assert function_exported?(GcpGcs, :create_bucket, 3)

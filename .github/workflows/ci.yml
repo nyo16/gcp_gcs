@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  MIX_ENV: test
+  ELIXIR_VERSION: "1.18"
+  OTP_VERSION: "27.0"
+
+jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-22.04
+    outputs:
+      cache-key: ${{ steps.key.outputs.value }}
+      plt-key: ${{ steps.key.outputs.plt }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Compute cache keys
+        id: key
+        env:
+          LOCK_HASH: ${{ hashFiles('mix.lock') }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          echo "value=${RUNNER_OS}-mix-${ELIXIR_VERSION}-${OTP_VERSION}-test-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+          echo "plt=${RUNNER_OS}-plt-${ELIXIR_VERSION}-${OTP_VERSION}-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache deps & build
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ steps.key.outputs.value }}
+
+      - run: mix deps.get
+        if: steps.cache.outputs.cache-hit != 'true'
+
+      - run: mix compile --warnings-as-errors
+        if: steps.cache.outputs.cache-hit != 'true'
+
+  lint:
+    name: Format & Credo
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - run: mix format --check-formatted
+      - run: mix credo --strict
+
+  test:
+    name: Tests
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Start GCS emulator (fake-gcs-server)
+        run: |
+          docker compose up -d
+          for i in $(seq 1 30); do
+            if nc -z localhost 4443; then echo "emulator up"; break; fi
+            sleep 1
+          done
+
+      - name: Run tests (unit + integration)
+        run: mix test --include integration
+
+      - name: Stop emulator
+        if: always()
+        run: docker compose down
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-22.04
+    needs: [setup]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ needs.setup.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Cache PLTs
+        uses: actions/cache@v5
+        with:
+          path: priv/plts
+          key: ${{ needs.setup.outputs.plt-key }}
+          restore-keys: |
+            ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+
+      - run: mix dialyzer
