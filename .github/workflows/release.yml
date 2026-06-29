@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ELIXIR_VERSION: "1.18"
+  OTP_VERSION: "27.0"
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-22.04
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - run: mix credo --strict
+
+      - name: Start GCS emulator (fake-gcs-server)
+        run: |
+          docker compose up -d
+          for i in $(seq 1 30); do
+            if nc -z localhost 4443; then echo "emulator up"; break; fi
+            sleep 1
+          done
+
+      - run: mix test --include integration
+
+      - name: Stop emulator
+        if: always()
+        run: docker compose down
+
+  publish:
+    name: Publish to Hex
+    runs-on: ubuntu-22.04
+    needs: [verify]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Set version from tag
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          sed -i'' -e "s/@version \".*\"/@version \"${TAG_VERSION}\"/" mix.exs
+          grep '@version' mix.exs
+
+      - run: mix deps.get
+        env:
+          MIX_ENV: dev
+      - run: mix compile
+        env:
+          MIX_ENV: dev
+
+      - name: Publish to Hex
+        run: mix hex.publish --yes
+        env:
+          MIX_ENV: dev
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+  github_release:
+    name: GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [publish]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release create "$TAG_NAME" --generate-notes --verify-tag || true

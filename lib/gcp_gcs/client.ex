@@ -104,7 +104,7 @@ defmodule GcpGcs.Client do
         {:ok, {_, status, resp_headers, user_acc, err_buf}} ->
           finish_stream(status, resp_headers, user_acc, err_buf)
 
-        {:error, reason} ->
+        {:error, reason, _partial_acc} ->
           {:error, Error.from_transport(reason)}
       end
     end
@@ -200,7 +200,6 @@ defmodule GcpGcs.Client do
   defp interpret_json(%Finch.Response{status: status, body: body}) when status in 200..299 do
     case body do
       "" -> {:ok, %{}}
-      nil -> {:ok, %{}}
       data -> {:ok, decode_maybe_json(data)}
     end
   end
@@ -209,12 +208,11 @@ defmodule GcpGcs.Client do
     {:error, Error.from_response(status, decode_maybe_json(body))}
   end
 
+  # Finch response bodies are always binaries; callers never pass anything else.
   defp decode_maybe_json(body) when is_binary(body) do
     case Jason.decode(body) do
       {:ok, decoded} -> decoded
       {:error, _} -> body
     end
   end
-
-  defp decode_maybe_json(body), do: body
 end

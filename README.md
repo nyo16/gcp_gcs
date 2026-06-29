@@ -5,6 +5,7 @@ A Google Cloud Storage client for Elixir, built on the JSON API over
 and **resumable** uploads, and **streamed** downloads — with structured errors,
 token caching, and telemetry.
 
+[![CI](https://github.com/nyo16/gcp_gcs/actions/workflows/ci.yml/badge.svg)](https://github.com/nyo16/gcp_gcs/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/gcp_gcs.svg)](https://hex.pm/packages/gcp_gcs)
 
 ## Features

@@ -13,6 +13,10 @@ defmodule GcpGcs.MixProject do
       deps: deps(),
       test_coverage: [tool: ExCoveralls],
       elixirc_paths: elixirc_paths(Mix.env()),
+      dialyzer: [
+        plt_local_path: "priv/plts",
+        plt_core_path: "priv/plts"
+      ],
 
       # Docs
       name: "GcpGcs",
@@ -75,7 +79,8 @@ defmodule GcpGcs.MixProject do
       {:goth, "~> 1.4", optional: true},
       {:excoveralls, "~> 0.18", only: :test},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 end
