@@ -1,7 +1,7 @@
 defmodule GcpGcs.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/nyo16/gcp_gcs"
 
   def project do
@@ -65,7 +65,7 @@ defmodule GcpGcs.MixProject do
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
-        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+        "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md"
       },
       files: ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG*)
     ]
