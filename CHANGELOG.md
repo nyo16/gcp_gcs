@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Use Elixir's built-in `JSON` module (Elixir 1.18+) for encoding/decoding
+  instead of `Jason`, and drop the `jason` dependency.
+
+### Fixed
+- **Resumable uploads** — send an explicit `Content-Length` on both resumable
+  requests so real GCS no longer rejects them with `411 Length Required`: `0`
+  on the bodyless session-initiation POST, and the known file size on the
+  session PUT (which also stops Mint from falling back to
+  `transfer-encoding: chunked` for the stream body). The `fake-gcs-server`
+  emulator does not enforce this, so the failure only appeared against the
+  live API. Regression covered by a `Bypass`-based test that asserts the exact
+  headers sent.
+
 ## [0.1.0] - 2026-06-25
 
 Initial release.
