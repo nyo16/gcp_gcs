@@ -27,7 +27,7 @@ token caching, and telemetry.
 ```elixir
 def deps do
   [
-    {:gcp_gcs, "~> 0.1.0"}
+    {:gcp_gcs, "~> 0.2.0"}
   ]
 end
 ```
