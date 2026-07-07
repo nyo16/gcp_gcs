@@ -167,7 +167,7 @@ defmodule GcpGcs.Client do
   defp encode_body(nil), do: {nil, []}
 
   defp encode_body({:json, term}) do
-    {Jason.encode!(term), [{"content-type", @json_content_type}]}
+    {JSON.encode!(term), [{"content-type", @json_content_type}]}
   end
 
   defp encode_body({:binary, data, content_type}) when is_binary(data) do
@@ -210,7 +210,7 @@ defmodule GcpGcs.Client do
 
   # Finch response bodies are always binaries; callers never pass anything else.
   defp decode_maybe_json(body) when is_binary(body) do
-    case Jason.decode(body) do
+    case JSON.decode(body) do
       {:ok, decoded} -> decoded
       {:error, _} -> body
     end

@@ -203,7 +203,7 @@ honored. When an emulator is configured, authentication is skipped.
 Using Goth:
 
 ```elixir
-credentials = "GOOGLE_APPLICATION_CREDENTIALS_JSON" |> System.fetch_env!() |> Jason.decode!()
+credentials = "GOOGLE_APPLICATION_CREDENTIALS_JSON" |> System.fetch_env!() |> JSON.decode!()
 
 children = [
   {Goth,

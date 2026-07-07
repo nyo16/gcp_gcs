@@ -138,8 +138,17 @@ defmodule GcpGcs.Upload do
     url = Config.upload_base() <> "/b/#{bucket}/o"
     query = compact(uploadType: "resumable", name: object, predefinedAcl: opts[:predefined_acl])
     ct = opts[:content_type] || @default_content_type
-    headers = [{"x-upload-content-type", ct}]
-    body = if opts[:attrs], do: {:json, opts[:attrs]}, else: nil
+
+    # GCS returns 411 Length Required if the initiation POST has no
+    # Content-Length. Finch/Mint set it automatically for a binary (JSON) body,
+    # but a bodyless request needs it declared explicitly as 0. (The
+    # fake-gcs-server emulator used in tests does not enforce this, so the
+    # failure only surfaces against the real API.)
+    {body, headers} =
+      case opts[:attrs] do
+        nil -> {nil, [{"content-length", "0"}, {"x-upload-content-type", ct}]}
+        attrs -> {{:json, attrs}, [{"x-upload-content-type", ct}]}
+      end
 
     case Client.raw_request(:post, url,
            query: query,
@@ -226,7 +235,14 @@ defmodule GcpGcs.Upload do
   defp upload_file_body(bucket, object, path, size, opts) do
     with {:ok, session} <- start_resumable_upload(bucket, object, opts) do
       body = {:stream, File.stream!(path, chunk_size(opts)), opts[:content_type]}
-      headers = [{"content-range", content_range(0, size, size)}]
+
+      # Declaring Content-Length keeps Mint from sending the stream body with
+      # transfer-encoding: chunked, which GCS rejects with 411 on the session
+      # PUT. The size is known from File.stat here, so this costs nothing.
+      headers = [
+        {"content-range", content_range(0, size, size)},
+        {"content-length", Integer.to_string(size)}
+      ]
 
       case Client.raw_request(:put, session,
              headers: headers,
@@ -369,7 +385,7 @@ defmodule GcpGcs.Upload do
   end
 
   defp decode_body(body) when is_binary(body) and body != "" do
-    case Jason.decode(body) do
+    case JSON.decode(body) do
       {:ok, decoded} -> decoded
       {:error, _} -> body
     end
