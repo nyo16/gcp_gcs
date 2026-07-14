@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Resumable uploads** — `start_resumable_upload/3` accepts an `:origin`
+  option, forwarded as the `Origin` header on the session-initiation POST.
+  Required for browser-based resumable uploads (server initiates the session,
+  browser PUTs the bytes): GCS only returns CORS headers on requests to the
+  session URI when the session was initiated with an `Origin` — the bucket's
+  CORS configuration alone does not apply to session URIs. Opt-in and
+  backwards-compatible; mirrors `origin` in Google's official clients
+  (google-cloud-node's `createResumableUpload`, google-cloud-python's
+  `Blob.create_resumable_upload_session`). The `fake-gcs-server` emulator does
+  not enforce CORS, so this is covered by `Bypass`-based tests asserting the
+  exact headers sent.
+
 ## [0.2.0] - 2026-07-07
 
 ### Changed

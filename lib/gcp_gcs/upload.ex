@@ -123,6 +123,14 @@ defmodule GcpGcs.Upload do
   ## Options
   - `:content_type` — value sent as `X-Upload-Content-Type`
   - `:attrs` — Object resource metadata (sent as the JSON request body)
+  - `:origin` — browser origin to forward as the `Origin` header. Required for
+    browser-based resumable uploads (initiate the session server-side, hand the
+    session URI to the browser): GCS only returns CORS headers on requests to
+    the session URI if the session was initiated with an `Origin` — the
+    bucket's CORS configuration alone does not apply. Must be the origin the
+    browser will upload from. Mirrors `origin` in Google's official clients
+    (e.g. `createResumableUpload` in google-cloud-node,
+    `Blob.create_resumable_upload_session` in google-cloud-python).
   - `:timeout` — request timeout in ms
   """
   @spec start_resumable_upload(String.t(), String.t(), keyword()) ::
@@ -149,6 +157,8 @@ defmodule GcpGcs.Upload do
         nil -> {nil, [{"content-length", "0"}, {"x-upload-content-type", ct}]}
         attrs -> {{:json, attrs}, [{"x-upload-content-type", ct}]}
       end
+
+    headers = put_origin(headers, opts)
 
     case Client.raw_request(:post, url,
            query: query,
@@ -307,6 +317,17 @@ defmodule GcpGcs.Upload do
 
       {:error, %Error{}} = error ->
         error
+    end
+  end
+
+  # Forward the browser Origin so GCS CORS-tags the session; without it the
+  # subsequent browser PUT succeeds (200) but its response carries no
+  # Access-Control-Allow-Origin header, so the browser blocks reading it and
+  # the upload is reported as failed client-side.
+  defp put_origin(headers, opts) do
+    case opts[:origin] do
+      origin when is_binary(origin) -> [{"origin", origin} | headers]
+      _ -> headers
     end
   end
 
