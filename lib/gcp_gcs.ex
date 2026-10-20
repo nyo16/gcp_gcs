@@ -28,8 +28,10 @@ defmodule GcpGcs do
 
   ## Error handling
 
-  All functions return `{:ok, result}`/`:ok` or `{:error, %GcpGcs.Error{}}`.
-  Pattern match on the error code:
+  All functions return `{:ok, result}`/`:ok` or `{:error, %GcpGcs.Error{}}`
+  and never raise for invalid input, HTTP failures or transport errors. The
+  one extra return shape is `upload_chunk/3`'s `{:resume, persisted}` for an
+  incomplete resumable session. Pattern match on the error code:
 
       case GcpGcs.get_object("my-bucket", "missing.txt") do
         {:ok, object} -> object

@@ -27,7 +27,8 @@ token caching, and telemetry.
 ```elixir
 def deps do
   [
-    {:gcp_gcs, "~> 0.2.0"}
+    {:gcp_gcs, "~> 0.2.2"},
+    {:goth, "~> 1.4"}  # optional, service-account auth
   ]
 end
 ```
@@ -97,6 +98,22 @@ tuned with `chunk_size:` (rounded to a 256 KiB multiple).
 {:resume, 262144} = GcpGcs.upload_chunk(session, chunk1, offset: 0, total: nil)
 {:ok, _object}    = GcpGcs.upload_chunk(session, last_chunk, offset: 262144, total: 300000)
 ```
+
+`{:resume, persisted}` reports how many bytes the session holds; if it is less
+than what you sent, resend from `persisted`.
+
+**Session URIs are bearer capabilities.** Anyone holding one can write the
+object until the session expires (one week), with no further credentials, so:
+
+- never log session URIs or put them in error reports;
+- hand a session URI only to the user it was created for (e.g. the browser
+  session that will upload), never share it across users;
+- `upload_chunk/3` only accepts session URIs on the configured endpoint's
+  upload API and sends no `authorization` header with them.
+
+For browser uploads, take `:origin` only from an allow-list of your own
+origins, never from the request's `Origin` header as-is: GCS CORS-enables the
+session for exactly that origin.
 
 ## Downloads
 
@@ -179,6 +196,10 @@ config :gcp_gcs, :finch, pool_size: 50, pool_count: 1
 
 # Optional: default request timeout (ms)
 config :gcp_gcs, :default_timeout, 30_000
+
+# Optional: max wait for a pooled connection (ms); exceeding it returns
+# {:error, %GcpGcs.Error{code: :resource_exhausted}}
+config :gcp_gcs, :pool_timeout, 5_000
 ```
 
 ### Development / test (emulator)
@@ -231,6 +252,10 @@ credentials.
   nil
 )
 ```
+
+Request metadata includes bucket and object names; `upload_file/4` and
+`download_to_file/4` also carry local file paths (`:source`/`:destination`).
+Treat telemetry metadata as potentially sensitive before exporting it.
 
 ## Testing
 

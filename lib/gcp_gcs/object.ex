@@ -93,10 +93,11 @@ defmodule GcpGcs.Object do
   """
   @spec update(String.t(), String.t(), map(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
-  def update(bucket, object, attrs, opts \\ []) when is_map(attrs) do
+  def update(bucket, object, attrs, opts \\ []) do
     Telemetry.span(:update_object, %{bucket: bucket, object: object}, fn ->
       with {:ok, _} <- Validation.validate_bucket(bucket),
-           {:ok, _} <- Validation.validate_object(object) do
+           {:ok, _} <- Validation.validate_object(object),
+           {:ok, _} <- Validation.validate_map(attrs, "attrs") do
         Client.request(:patch, object_url(bucket, object),
           body: {:json, attrs},
           timeout: opts[:timeout]
@@ -236,7 +237,7 @@ defmodule GcpGcs.Object do
         {:ok, resource}
 
       {:ok, other} ->
-        {:ok, other}
+        {:error, Error.new(:internal, "unexpected rewrite response", other)}
 
       {:error, %Error{}} = error ->
         error

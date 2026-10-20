@@ -2,27 +2,16 @@ defmodule GcpGcs.ConfigTest do
   # Not async: these tests mutate global application/system env.
   use ExUnit.Case, async: false
 
+  import GcpGcs.EnvHelper
+
   alias GcpGcs.Config
 
+  # Start every test from "nothing configured"; the helpers restore the
+  # original values (including "unset") on exit, so the direct put_env calls
+  # in the tests below are undone too.
   setup do
-    original = Application.get_env(:gcp_gcs, :emulator)
-    original_host = System.get_env("STORAGE_EMULATOR_HOST")
-
-    on_exit(fn ->
-      if is_nil(original) do
-        Application.delete_env(:gcp_gcs, :emulator)
-      else
-        Application.put_env(:gcp_gcs, :emulator, original)
-      end
-
-      if original_host do
-        System.put_env("STORAGE_EMULATOR_HOST", original_host)
-      else
-        System.delete_env("STORAGE_EMULATOR_HOST")
-      end
-    end)
-
-    :ok
+    delete_env_for_test(:gcp_gcs, :emulator)
+    put_system_env_for_test("STORAGE_EMULATOR_HOST", nil)
   end
 
   describe "emulator config (keyword list)" do

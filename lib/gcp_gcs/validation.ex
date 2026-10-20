@@ -2,7 +2,7 @@ defmodule GcpGcs.Validation do
   @moduledoc false
   # Input validation for GcpGcs. Returns {:ok, value} | {:error, %GcpGcs.Error{}}.
 
-  alias GcpGcs.Error
+  alias GcpGcs.{Config, Error}
 
   # Bucket naming: 3-63 chars, lowercase letters/digits/hyphens/underscores/dots,
   # must start and end with a letter or digit. (Dotted "domain-named" buckets up
@@ -85,6 +85,44 @@ defmodule GcpGcs.Validation do
     {:error, Error.new(:validation_error, "#{field} must be a binary")}
   end
 
+  @spec validate_enumerable(term(), String.t()) :: {:ok, Enumerable.t()} | {:error, Error.t()}
+  def validate_enumerable(value, field) do
+    if Enumerable.impl_for(value) do
+      {:ok, value}
+    else
+      {:error,
+       Error.new(:validation_error, "#{field} must be a binary, {:file, path} or an Enumerable")}
+    end
+  end
+
+  @spec validate_non_neg_integer(term(), String.t()) ::
+          {:ok, non_neg_integer()} | {:error, Error.t()}
+  def validate_non_neg_integer(value, _field) when is_integer(value) and value >= 0,
+    do: {:ok, value}
+
+  def validate_non_neg_integer(_, field) do
+    {:error, Error.new(:validation_error, "#{field} must be a non-negative integer")}
+  end
+
+  @spec validate_optional_non_neg_integer(term(), String.t()) ::
+          {:ok, non_neg_integer() | nil} | {:error, Error.t()}
+  def validate_optional_non_neg_integer(nil, _field), do: {:ok, nil}
+  def validate_optional_non_neg_integer(value, field), do: validate_non_neg_integer(value, field)
+
+  @spec validate_map(term(), String.t()) :: {:ok, map()} | {:error, Error.t()}
+  def validate_map(value, _field) when is_map(value), do: {:ok, value}
+
+  def validate_map(_, field) do
+    {:error, Error.new(:validation_error, "#{field} must be a map")}
+  end
+
+  @spec validate_reducer(term()) :: {:ok, (term(), term() -> term())} | {:error, Error.t()}
+  def validate_reducer(fun) when is_function(fun, 2), do: {:ok, fun}
+
+  def validate_reducer(_) do
+    {:error, Error.new(:validation_error, "reducer must be a function of arity 2")}
+  end
+
   @spec validate_source_objects(term()) :: {:ok, [map()]} | {:error, Error.t()}
   def validate_source_objects([_ | _] = sources) do
     if Enum.all?(sources, &valid_source?/1) do
@@ -106,4 +144,34 @@ defmodule GcpGcs.Validation do
   defp valid_source?(%{name: name}) when is_binary(name) and byte_size(name) > 0, do: true
   defp valid_source?(%{"name" => name}) when is_binary(name) and byte_size(name) > 0, do: true
   defp valid_source?(_), do: false
+
+  # A resumable session URI is a bearer capability: it must point at the
+  # configured endpoint's upload API, never at an arbitrary host, so a
+  # caller-supplied or server-returned URI can't redirect object bytes.
+  @spec validate_session_uri(term()) :: {:ok, String.t()} | {:error, Error.t()}
+  def validate_session_uri(uri) when is_binary(uri) do
+    {scheme, host, port} = Config.endpoint()
+    expected_scheme = Atom.to_string(scheme)
+
+    case URI.new(uri) do
+      {:ok, %URI{scheme: ^expected_scheme, host: ^host, port: ^port, userinfo: nil, path: path}}
+      when is_binary(path) ->
+        if String.starts_with?(path, "/upload/storage/v1/"),
+          do: {:ok, uri},
+          else: session_uri_error()
+
+      _ ->
+        session_uri_error()
+    end
+  end
+
+  def validate_session_uri(_), do: session_uri_error()
+
+  defp session_uri_error do
+    {:error,
+     Error.new(
+       :validation_error,
+       "session URI must be a resumable upload URI on the configured endpoint"
+     )}
+  end
 end

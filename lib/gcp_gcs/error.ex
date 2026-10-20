@@ -80,8 +80,16 @@ defmodule GcpGcs.Error do
 
   @doc """
   Maps a transport-level reason (Finch/Mint error) to an error struct.
+
+  An invalid request header value is reported by header name only: the value
+  (and the wrapped Mint error that carries it) may be a bearer token.
   """
   @spec from_transport(term()) :: t()
+  def from_transport(%{__struct__: mod, reason: {:invalid_header_value, name, _value}})
+      when mod in [Finch.HTTPError, Mint.HTTPError] do
+    new(:connection_error, "invalid value for header #{name}", {:invalid_header_value, name})
+  end
+
   def from_transport(%{__exception__: true} = exception) do
     new(:connection_error, Exception.message(exception), exception)
   end

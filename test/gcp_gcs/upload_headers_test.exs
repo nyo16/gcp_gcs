@@ -19,17 +19,15 @@ defmodule GcpGcs.UploadHeadersTest do
   """
   use ExUnit.Case, async: false
 
+  import GcpGcs.EnvHelper
+
   alias GcpGcs.Upload
 
   @bucket "test-bucket"
 
   setup do
     bypass = Bypass.open()
-    original = Application.get_env(:gcp_gcs, :emulator)
-
-    Application.put_env(:gcp_gcs, :emulator, scheme: "http", host: "localhost", port: bypass.port)
-    on_exit(fn -> Application.put_env(:gcp_gcs, :emulator, original) end)
-
+    put_emulator_for_test(bypass.port)
     {:ok, bypass: bypass}
   end
 
@@ -118,5 +116,6 @@ defmodule GcpGcs.UploadHeadersTest do
     assert List.keyfind(headers, "transfer-encoding", 0) == nil
   end
 
-  defp session_uri(bypass), do: "http://localhost:#{bypass.port}/upload/session/abc123"
+  defp session_uri(bypass),
+    do: "http://localhost:#{bypass.port}/upload/storage/v1/b/#{@bucket}/o?upload_id=abc123"
 end

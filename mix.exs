@@ -1,7 +1,7 @@
 defmodule GcpGcs.MixProject do
   use Mix.Project
 
-  @version "0.2.1"
+  @version "0.2.2"
   @source_url "https://github.com/nyo16/gcp_gcs"
 
   def project do
@@ -73,14 +73,17 @@ defmodule GcpGcs.MixProject do
 
   defp deps do
     [
-      {:finch, "~> 0.19"},
+      # >= 0.24: pulls Mint CVE fixes and Finch PR #397 (pool checkout timeout
+      # no longer crashes with CaseClauseError under mint 1.11).
+      {:finch, "~> 0.24"},
       {:telemetry, "~> 1.0"},
       {:goth, "~> 1.4", optional: true},
       {:bypass, "~> 2.1", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false}
     ]
   end
 end

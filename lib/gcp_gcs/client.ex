@@ -34,6 +34,10 @@ defmodule GcpGcs.Client do
   - `:body` — request body, see `t:body/0` (default `nil`)
   - `:auth` — set `false` to skip authentication (default `true`)
   - `:timeout` — receive timeout in ms (default `GcpGcs.Config.default_timeout/0`)
+  - `:pool_timeout` — max wait in ms for a pooled connection (default
+    `GcpGcs.Config.pool_timeout/0`); exceeding it returns
+    `{:error, %GcpGcs.Error{code: :resource_exhausted}}`
+  - `:finch` — Finch instance name (default `GcpGcs.Config.finch_name/0`)
 
   Returns `{:ok, decoded}` on a 2xx response (`%{}` when the body is empty),
   or `{:error, %GcpGcs.Error{}}`.
@@ -59,15 +63,13 @@ defmodule GcpGcs.Client do
          {body_iodata, body_headers} <- encode_body(Keyword.get(opts, :body)) do
       headers = auth_headers ++ body_headers ++ Keyword.get(opts, :headers, [])
       full_url = append_query(url, Keyword.get(opts, :query))
-      # `|| default` (not Keyword.get/3 default) so an explicit `timeout: nil`
-      # from callers still resolves to the default rather than reaching Finch.
-      timeout = Keyword.get(opts, :timeout) || Config.default_timeout()
 
       method
       |> Finch.build(full_url, headers, body_iodata)
-      |> Finch.request(Config.finch_name(), receive_timeout: timeout)
+      |> checkout_safe(&Finch.request(&1, finch(opts), finch_opts(opts)))
       |> case do
         {:ok, %Finch.Response{} = response} -> {:ok, response}
+        {:error, %Error{}} = error -> error
         {:error, reason} -> {:error, Error.from_transport(reason)}
       end
     end
@@ -89,25 +91,59 @@ defmodule GcpGcs.Client do
     with {:ok, auth_headers} <- auth_headers(opts) do
       headers = auth_headers ++ Keyword.get(opts, :headers, [])
       full_url = append_query(url, Keyword.get(opts, :query))
-      # `|| default` (not Keyword.get/3 default) so an explicit `timeout: nil`
-      # from callers still resolves to the default rather than reaching Finch.
-      timeout = Keyword.get(opts, :timeout) || Config.default_timeout()
 
       # Track status so we can divert the body into an error buffer on failure.
       init = {:status, nil, [], acc, []}
 
       request = Finch.build(method, full_url, headers)
+      step = &stream_step(&1, &2, reducer)
 
-      case Finch.stream(request, Config.finch_name(), init, &stream_step(&1, &2, reducer),
-             receive_timeout: timeout
-           ) do
+      case checkout_safe(request, &Finch.stream(&1, finch(opts), init, step, finch_opts(opts))) do
         {:ok, {_, status, resp_headers, user_acc, err_buf}} ->
           finish_stream(status, resp_headers, user_acc, err_buf)
+
+        {:error, %Error{}} = error ->
+          error
 
         {:error, reason, _partial_acc} ->
           {:error, Error.from_transport(reason)}
       end
     end
+  end
+
+  # Transport options ----------------------------------------------------------
+
+  defp finch(opts), do: Keyword.get(opts, :finch) || Config.finch_name()
+
+  # `|| default` (not Keyword.get/3 default) so an explicit `timeout: nil`
+  # from callers still resolves to the default rather than reaching Finch.
+  defp finch_opts(opts) do
+    [
+      receive_timeout: Keyword.get(opts, :timeout) || Config.default_timeout(),
+      pool_timeout: Keyword.get(opts, :pool_timeout) || Config.pool_timeout()
+    ]
+  end
+
+  # Finch *raises* when no pooled connection frees up within `:pool_timeout`:
+  # its HTTP/1 pool turns NimblePool's checkout exit into a plain RuntimeError
+  # with this message (finch 0.24 `Finch.HTTP1.Pool.request/6`). Only that
+  # error becomes a tuple; anything else is a bug and keeps propagating.
+  @checkout_timeout_message "Finch was unable to provide a connection within the timeout"
+
+  defp checkout_safe(request, fun) do
+    fun.(request)
+  rescue
+    e in RuntimeError ->
+      if String.starts_with?(e.message, @checkout_timeout_message) do
+        {:error,
+         Error.new(
+           :resource_exhausted,
+           "no pooled connection became available within the pool timeout",
+           :pool_timeout
+         )}
+      else
+        reraise e, __STACKTRACE__
+      end
   end
 
   @doc """

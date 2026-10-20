@@ -4,10 +4,13 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ELIXIR_VERSION: "1.18"
-  OTP_VERSION: "27.0"
+  ELIXIR_VERSION: "1.20"
+  OTP_VERSION: "29"
 
 jobs:
   verify:
@@ -16,25 +19,29 @@ jobs:
     env:
       MIX_ENV: test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
+      - run: mix compile --no-optional-deps --warnings-as-errors --force
       - run: mix format --check-formatted
       - run: mix credo --strict
 
       - name: Start GCS emulator (fake-gcs-server)
         run: |
           docker compose up -d
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if nc -z localhost 4443; then echo "emulator up"; break; fi
             sleep 1
           done
+          nc -z localhost 4443 || { echo "emulator failed"; exit 1; }
 
       - run: mix test --include integration
 
@@ -46,12 +53,14 @@ jobs:
     name: Publish to Hex
     runs-on: ubuntu-22.04
     needs: [verify]
-    permissions:
-      contents: read
+    # HEX_API_KEY lives in this environment's secrets (with required reviewers).
+    environment: hex
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -69,6 +78,11 @@ jobs:
         env:
           MIX_ENV: dev
 
+      - name: Audit dependencies
+        run: mix deps.audit && mix hex.audit
+        env:
+          MIX_ENV: dev
+
       - name: Publish to Hex
         run: mix hex.publish --yes
         env:
@@ -82,7 +96,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Create GitHub release
         env:

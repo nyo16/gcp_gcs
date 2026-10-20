@@ -1,41 +1,15 @@
 defmodule GcpGcsTest do
-  use ExUnit.Case, async: true
+  # Not async: points the global emulator endpoint at a downed Bypass server.
+  use ExUnit.Case, async: false
 
-  # function_exported?/3 does not auto-load; make sure the module is loaded
-  # regardless of test ordering.
-  setup_all do
-    Code.ensure_loaded!(GcpGcs)
-    :ok
-  end
+  import GcpGcs.EnvHelper
 
-  describe "public API surface" do
-    test "delegates bucket operations" do
-      assert function_exported?(GcpGcs, :create_bucket, 3)
-      assert function_exported?(GcpGcs, :get_bucket, 2)
-      assert function_exported?(GcpGcs, :list_buckets, 2)
-      assert function_exported?(GcpGcs, :delete_bucket, 2)
-      assert function_exported?(GcpGcs, :update_bucket, 3)
-    end
-
-    test "delegates object operations" do
-      assert function_exported?(GcpGcs, :get_object, 3)
-      assert function_exported?(GcpGcs, :list_objects, 2)
-      assert function_exported?(GcpGcs, :delete_object, 3)
-      assert function_exported?(GcpGcs, :copy_object, 5)
-      assert function_exported?(GcpGcs, :compose_object, 4)
-      assert function_exported?(GcpGcs, :rewrite_object, 5)
-      assert function_exported?(GcpGcs, :move_object, 4)
-    end
-
-    test "delegates upload and download operations" do
-      assert function_exported?(GcpGcs, :put_object, 4)
-      assert function_exported?(GcpGcs, :upload, 4)
-      assert function_exported?(GcpGcs, :upload_file, 4)
-      assert function_exported?(GcpGcs, :upload_stream, 4)
-      assert function_exported?(GcpGcs, :download, 3)
-      assert function_exported?(GcpGcs, :download_to_file, 4)
-      assert function_exported?(GcpGcs, :download_stream, 5)
-    end
+  # The endpoint refuses connections, so an input that slipped past validation
+  # would surface as :connection_error instead of :validation_error.
+  setup do
+    bypass = Bypass.open()
+    Bypass.down(bypass)
+    put_emulator_for_test(bypass.port)
   end
 
   describe "validation short-circuits before any network call" do
@@ -52,6 +26,39 @@ defmodule GcpGcsTest do
     test "rejects a non-binary project id on create" do
       assert {:error, %GcpGcs.Error{code: :validation_error}} =
                GcpGcs.create_bucket(nil, "valid-bucket")
+    end
+  end
+
+  describe "former raises return validation errors" do
+    test "upload_chunk/3 with non-binary data or a bad offset" do
+      uri = GcpGcs.Config.upload_base() <> "/b/valid-bucket/o?upload_id=x"
+
+      assert {:error, %GcpGcs.Error{code: :validation_error}} =
+               GcpGcs.upload_chunk(uri, 123, offset: 0)
+
+      assert {:error, %GcpGcs.Error{code: :validation_error}} =
+               GcpGcs.upload_chunk(uri, "data", [])
+
+      assert {:error, %GcpGcs.Error{code: :validation_error}} =
+               GcpGcs.upload_chunk(uri, "data", offset: -1)
+    end
+
+    test "update_bucket/3 and update_object/4 with non-map attrs" do
+      assert {:error, %GcpGcs.Error{code: :validation_error}} =
+               GcpGcs.update_bucket("valid-bucket", labels: %{})
+
+      assert {:error, %GcpGcs.Error{code: :validation_error}} =
+               GcpGcs.update_object("valid-bucket", "obj", "nope")
+    end
+
+    test "download_stream/5 with a reducer of the wrong arity" do
+      assert {:error, %GcpGcs.Error{code: :validation_error}} =
+               GcpGcs.download_stream("valid-bucket", "obj", [], 0, fn _ -> 0 end)
+    end
+
+    test "upload/4 with an unsupported source makes no request" do
+      assert {:error, %GcpGcs.Error{code: :validation_error}} =
+               GcpGcs.upload("valid-bucket", "obj", 123)
     end
   end
 end

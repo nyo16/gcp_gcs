@@ -45,7 +45,12 @@ defmodule GcpGcs.Download do
   @doc """
   Streams an object's contents to a local file at `path`, using constant memory.
 
-  Returns `:ok`. On error the partially-written file is removed.
+  The body is written to `path <> ".part"` and renamed to `path` only once the
+  download completes, so a partial file never appears at `path`. On any
+  error the `.part` file is removed. Write failures return
+  `{:error, %GcpGcs.Error{code: :io_error}}`.
+
+  Returns `:ok`.
   """
   @spec download_to_file(String.t(), String.t(), Path.t(), keyword()) ::
           :ok | {:error, Error.t()}
@@ -56,28 +61,51 @@ defmodule GcpGcs.Download do
   end
 
   defp do_download_to_file(bucket, object, path, opts) do
+    part = path <> ".part"
+
     with {:ok, _} <- Validation.validate_bucket(bucket),
          {:ok, _} <- Validation.validate_object(object),
-         {:ok, io} <- open_file(path) do
-      reducer = fn
-        {:data, chunk}, device ->
-          :ok = IO.binwrite(device, chunk)
-          device
+         {:ok, io} <- open_file(part) do
+      result =
+        try do
+          stream_media(bucket, object, opts, {io, :ok}, &write_chunk/2)
+        after
+          File.close(io)
+        end
 
-        _other, device ->
-          device
-      end
-
-      result = stream_media(bucket, object, opts, io, reducer)
-      File.close(io)
-      finish_to_file(result, path)
+      finish_to_file(result, part, path)
     end
   end
 
-  defp finish_to_file({:ok, {_status, _headers, _device}}, _path), do: :ok
+  # Accumulator is `{device, :ok | {:io_error, reason}}`; after the first
+  # failed write the remaining chunks are skipped.
+  defp write_chunk({:data, chunk}, {device, :ok}) do
+    case :file.write(device, chunk) do
+      :ok -> {device, :ok}
+      {:error, reason} -> {device, {:io_error, reason}}
+    end
+  end
 
-  defp finish_to_file({:error, %Error{}} = error, path) do
-    _ = File.rm(path)
+  defp write_chunk(_other, acc), do: acc
+
+  defp finish_to_file({:ok, {_status, _headers, {_device, :ok}}}, part, path) do
+    case File.rename(part, path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        _ = File.rm(part)
+        {:error, Error.new(:io_error, "could not move download into place at #{path}", reason)}
+    end
+  end
+
+  defp finish_to_file({:ok, {_status, _headers, {_device, {:io_error, reason}}}}, part, _path) do
+    _ = File.rm(part)
+    {:error, Error.new(:io_error, "could not write #{part}", reason)}
+  end
+
+  defp finish_to_file({:error, %Error{}} = error, part, _path) do
+    _ = File.rm(part)
     error
   end
 
@@ -99,7 +127,7 @@ defmodule GcpGcs.Download do
   @spec stream(String.t(), String.t(), keyword(), acc, (term(), acc -> acc)) ::
           {:ok, acc} | {:error, Error.t()}
         when acc: term()
-  def stream(bucket, object, opts, acc, reducer) when is_function(reducer, 2) do
+  def stream(bucket, object, opts, acc, reducer) do
     Telemetry.span(:download, %{bucket: bucket, object: object}, fn ->
       do_stream(bucket, object, opts, acc, reducer)
     end)
@@ -107,7 +135,8 @@ defmodule GcpGcs.Download do
 
   defp do_stream(bucket, object, opts, acc, reducer) do
     with {:ok, _} <- Validation.validate_bucket(bucket),
-         {:ok, _} <- Validation.validate_object(object) do
+         {:ok, _} <- Validation.validate_object(object),
+         {:ok, _} <- Validation.validate_reducer(reducer) do
       case stream_media(bucket, object, opts, acc, reducer) do
         {:ok, {_status, _headers, final_acc}} -> {:ok, final_acc}
         {:error, %Error{}} = error -> error

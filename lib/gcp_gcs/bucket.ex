@@ -108,9 +108,10 @@ defmodule GcpGcs.Bucket do
   Patches a bucket's metadata with `attrs` (a map of Bucket resource fields).
   """
   @spec update(String.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
-  def update(bucket, attrs, opts \\ []) when is_map(attrs) do
+  def update(bucket, attrs, opts \\ []) do
     Telemetry.span(:update_bucket, %{bucket: bucket}, fn ->
-      with {:ok, _} <- Validation.validate_bucket(bucket) do
+      with {:ok, _} <- Validation.validate_bucket(bucket),
+           {:ok, _} <- Validation.validate_map(attrs, "attrs") do
         Client.request(:patch, Config.json_base() <> "/b/#{bucket}",
           body: {:json, attrs},
           timeout: opts[:timeout]

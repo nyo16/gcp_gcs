@@ -16,6 +16,8 @@ defmodule GcpGcs.Telemetry do
     * `:operation` — atom, e.g. `:create_bucket`, `:get_object`, `:upload`, `:download`
     * `:bucket` — bucket name (when applicable)
     * `:object` — object name (when applicable)
+    * `:source` / `:destination` — **local file paths** for `upload_file/4`
+      and `download_to_file/4`; treat them as sensitive before exporting
     * `:result` — `:ok` for success, `{:error, code}` for known errors
 
   ## Auth events

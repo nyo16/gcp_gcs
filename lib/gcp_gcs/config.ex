@@ -31,11 +31,20 @@ defmodule GcpGcs.Config do
 
   ## Timeouts
 
+      # Receive timeout per request (ms)
       config :gcp_gcs, :default_timeout, 30_000
+
+      # Max wait for a free pooled connection (ms). When exceeded, requests
+      # return {:error, %GcpGcs.Error{code: :resource_exhausted}}.
+      config :gcp_gcs, :pool_timeout, 5_000
+
+  Both can be overridden per call with the `:timeout` and `:pool_timeout`
+  options.
   """
 
   @prod_host "storage.googleapis.com"
   @default_timeout 30_000
+  @default_pool_timeout 5_000
   @finch_name GcpGcs.Finch
 
   @type emulator :: %{scheme: String.t(), host: String.t(), port: pos_integer()}
@@ -48,6 +57,12 @@ defmodule GcpGcs.Config do
   @spec default_timeout() :: pos_integer()
   def default_timeout do
     Application.get_env(:gcp_gcs, :default_timeout, @default_timeout)
+  end
+
+  @doc "Max wait in milliseconds for a pooled connection."
+  @spec pool_timeout() :: pos_integer()
+  def pool_timeout do
+    Application.get_env(:gcp_gcs, :pool_timeout, @default_pool_timeout)
   end
 
   @doc """

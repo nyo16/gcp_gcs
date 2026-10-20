@@ -20,15 +20,19 @@ defmodule GcpGcs.UploadTest do
     end
   end
 
-  describe "next_offset/3" do
-    test "parses the stored byte range from a 308 'range' header" do
-      assert Upload.next_offset([{"range", "bytes=0-262143"}], 0, 262_144) == 262_144
-      assert Upload.next_offset([{"range", "0-524287"}], 0, 100) == 524_288
+  describe "next_offset/1" do
+    test "parses the persisted byte range from a 308 'range' header" do
+      assert Upload.next_offset([{"range", "bytes=0-262143"}]) == {:ok, 262_144}
+      assert Upload.next_offset([{"Range", "0-524287"}]) == {:ok, 524_288}
     end
 
-    test "falls back to offset + len when the header is missing or unparsable" do
-      assert Upload.next_offset([], 100, 50) == 150
-      assert Upload.next_offset([{"range", "garbage"}], 100, 50) == 150
+    test "a missing header means nothing has been persisted" do
+      assert Upload.next_offset([]) == {:ok, 0}
+    end
+
+    test "rejects ranges that don't start at 0 or can't be parsed" do
+      assert Upload.next_offset([{"range", "garbage"}]) == :error
+      assert Upload.next_offset([{"range", "bytes=5-10"}]) == :error
     end
   end
 
