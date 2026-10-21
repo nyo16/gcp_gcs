@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plug_cowboy/cowboy/cowlib/ranch from the test dependencies (and with them
   cowlib CVE-2026-43966).
 
-## [0.3.0] - 2026-10-20
+## [0.3.0] - 2026-10-21
 
 ### Breaking
 - **Unknown options are rejected.** Every public function validates its
@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Goth tokens are no longer cached in ETS** — Goth caches them itself.
 - After a resumable session exists, an error's `details` is
   `%{session_uri: uri, cause: original_details}`.
+- **gcloud runs are killed after `:gcloud_timeout`** (default 30 s), with
+  their child processes, and the request fails with `:unauthenticated`
+  (`details: :gcloud_timeout`). Previously a caller waited up to 60 s and the
+  gcloud process kept running.
+- **A 401 without credentials is not retried**: when no `authorization`
+  header was sent (emulator mode), a 401 is returned as is instead of being
+  retried once.
 
 ### Added
 - Per-call `:goth`, `:finch` and `:base_url` options (a per-call base URL
@@ -117,6 +124,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   less CPU).
 - Non-2xx download bodies are buffered up to 64 KiB for the error.
 - The token cache table is `:protected`; only its owner process writes it.
+- `clear_auth_cache/0` returns at once, even while a gcloud run is in
+  progress; requests after it fetch a new token, and the run that was in
+  progress answers its own callers but is not cached.
+- With `checksum: true`, `upload_stream/4` gets MD5 replies from a helper
+  process in the caller's mailbox: the enumerable (consumed in the caller)
+  must not consume messages it doesn't own, e.g. with a catch-all `receive`.
 
 ### Upgrading from 0.2.x
 
@@ -136,6 +149,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 7. If writes must never be retried at all, set
    `config :gcp_gcs, :retry, max_attempts: 1` (non-idempotent requests are
    never retried by default anyway).
+8. If gcloud can take longer than 30 s (e.g. a slow re-authentication), set
+   `config :gcp_gcs, :gcloud_timeout, ms`.
 
 ## [0.2.2] - 2026-10-20
 
