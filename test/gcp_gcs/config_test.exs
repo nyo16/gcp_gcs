@@ -87,13 +87,57 @@ defmodule GcpGcs.ConfigTest do
       refute Keyword.has_key?(pool, :conn_opts)
     end
 
-    test "the production https pool enforces certificate verification" do
+    test "https pools verify certificates without embedding the CA store in the pool config" do
       put_emulator(false)
-      pool = Config.finch_opts()[:pools]["https://storage.googleapis.com:443"]
-      transport_opts = pool[:conn_opts][:transport_opts]
+      pools = Config.finch_opts()[:pools]
 
-      assert transport_opts[:verify] == :verify_peer
-      assert is_list(transport_opts[:cacerts])
+      for key <- [:default, "https://storage.googleapis.com:443"] do
+        transport_opts = pools[key][:conn_opts][:transport_opts]
+
+        assert transport_opts[:verify] == :verify_peer
+        # Mint loads the OS trust store at connect time; a decoded list here
+        # would be copied with the connection on every pool checkout.
+        refute Keyword.has_key?(transport_opts, :cacerts)
+        refute Keyword.has_key?(transport_opts, :cacertfile)
+      end
+    end
+
+    test "the running pool rejects a server certificate from an unknown CA" do
+      rsa = [key: {:rsa, 2048, 65_537}]
+      chains = %{server_chain: %{root: rsa, peer: rsa}, client_chain: %{root: rsa, peer: rsa}}
+      server = :public_key.pkix_test_data(chains)[:server_config]
+
+      bandit =
+        start_supervised!(
+          {Bandit,
+           plug: fn conn, _ -> Plug.Conn.send_resp(conn, 200, "{}") end,
+           scheme: :https,
+           ip: {127, 0, 0, 1},
+           port: 0,
+           startup_log: false,
+           thousand_island_options: [transport_options: [cert: server[:cert], key: server[:key]]]}
+        )
+
+      {:ok, {_ip, port}} = ThousandIsland.listener_info(bandit)
+
+      assert {:error, %GcpGcs.Error{code: :connection_error, message: message}} =
+               GcpGcs.Client.request(:get, "https://localhost:#{port}/x",
+                 auth: false,
+                 retry: false
+               )
+
+      assert message =~ "Unknown CA"
+    end
+
+    @tag :capture_log
+    test "an invalid :gcloud_timeout falls back to the default instead of crashing callers" do
+      for invalid <- [:infinity, 0, -5, "1000"] do
+        put_env_for_test(:gcp_gcs, :gcloud_timeout, invalid)
+        assert Config.gcloud_timeout() == 30_000
+      end
+
+      put_env_for_test(:gcp_gcs, :gcloud_timeout, 250)
+      assert Config.gcloud_timeout() == 250
     end
 
     test "the default pool for other origins also enforces certificate verification" do
@@ -103,12 +147,11 @@ defmodule GcpGcs.ConfigTest do
       assert transport_opts[:verify] == :verify_peer
     end
 
-    test "pool size, count and protocols follow config, with per-scheduler shards by default" do
+    test "pool size, count and protocols follow config, with one 50-connection shard by default" do
       put_emulator(false)
       delete_env_for_test(:gcp_gcs, :finch)
       pool = Config.finch_opts()[:pools]["https://storage.googleapis.com:443"]
-      assert pool[:size] == 10
-      assert pool[:count] == System.schedulers_online()
+      assert {pool[:size], pool[:count]} == {50, 1}
       refute Keyword.has_key?(pool, :protocols)
 
       put_env_for_test(:gcp_gcs, :finch, pool_size: 3, pool_count: 2, protocols: [:http2])

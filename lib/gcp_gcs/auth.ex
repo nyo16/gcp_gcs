@@ -17,8 +17,10 @@ defmodule GcpGcs.Auth do
   skipped entirely and requests are sent without an `authorization` header.
   A per-call `:base_url` keeps authentication on.
 
-  A `401` response clears the cached token and the request is retried once
-  with a fresh one.
+  A `401` response to an authenticated request is retried once with a fresh
+  token. With the gcloud fallback only the token that was rejected is
+  replaced (a newer one fetched meanwhile is kept); Goth tokens are left to
+  Goth.
 
   ## Using Goth
 
@@ -57,13 +59,15 @@ defmodule GcpGcs.Auth do
   @doc false
   # The headers that authenticate a request: `{:ok, []}` in emulator mode
   # (unless a per-call `:base_url` is set), otherwise the bearer token for
-  # `opts[:goth]` or the configured source.
-  @spec request_headers(keyword()) :: {:ok, [{String.t(), String.t()}]} | {:error, Error.t()}
-  def request_headers(opts \\ []) do
+  # `opts[:goth]` or the configured source. `stale` is a bearer value the
+  # server rejected with a 401; the gcloud cache won't return it again.
+  @spec request_headers(keyword(), String.t() | nil) ::
+          {:ok, [{String.t(), String.t()}]} | {:error, Error.t()}
+  def request_headers(opts \\ [], stale \\ nil) do
     if is_nil(opts[:base_url]) and Config.emulator?() do
       {:ok, []}
     else
-      case get_token(opts) do
+      case get_token(opts, stale) do
         {:ok, token} -> {:ok, [{"authorization", token}]}
         {:error, _} = error -> error
       end
@@ -72,12 +76,14 @@ defmodule GcpGcs.Auth do
 
   @doc false
   # A bearer token string (`"Bearer <token>"`) for `opts[:goth]` or the
-  # configured source.
-  @spec get_token(keyword()) :: {:ok, String.t()} | {:error, Error.t()}
-  def get_token(opts \\ []) do
+  # configured source; see request_headers/2 for `stale`. Goth caches and
+  # refreshes its own tokens (and reports refreshes in its own telemetry), so
+  # `stale` and the `[:gcp_gcs, :auth]` span only apply to gcloud fetches.
+  @spec get_token(keyword(), String.t() | nil) :: {:ok, String.t()} | {:error, Error.t()}
+  def get_token(opts \\ [], stale \\ nil) do
     case opts[:goth] || Application.get_env(:gcp_gcs, :goth) do
-      nil -> gcloud_token()
-      goth -> Telemetry.auth_span(%{source: :goth}, fn -> get_token_from_goth(goth) end)
+      nil -> gcloud_token(stale)
+      goth -> get_token_from_goth(goth)
     end
   end
 
@@ -133,9 +139,9 @@ defmodule GcpGcs.Auth do
 
   # gcloud --------------------------------------------------------------------
 
-  defp gcloud_token do
+  defp gcloud_token(stale) do
     if Config.gcloud_fallback?() do
-      Cache.fetch(fn -> Telemetry.auth_span(%{source: :gcloud}, &fetch_from_gcloud/0) end)
+      Cache.fetch(fn -> Telemetry.auth_span(%{source: :gcloud}, &fetch_from_gcloud/0) end, stale)
     else
       {:error,
        Error.new(
@@ -161,8 +167,10 @@ defmodule GcpGcs.Auth do
 
   # Returns {:ok, bearer, ttl_ms} | {:error, error} for GcpGcs.Auth.Cache.
   defp fetch_from_gcloud do
-    case System.cmd(Config.gcloud_path(), @gcloud_args, stderr_to_stdout: true) do
-      {output, 0} ->
+    timeout = Config.gcloud_timeout()
+
+    case run_gcloud(Config.gcloud_path(), @gcloud_args, timeout) do
+      {:ok, output, 0} ->
         case parse_gcloud_output(output) do
           {:ok, token, ttl_ms} ->
             {:ok, "Bearer " <> token, ttl_ms}
@@ -172,7 +180,7 @@ defmodule GcpGcs.Auth do
             {:error, Error.new(:unauthenticated, "gcloud returned malformed output")}
         end
 
-      {error_output, exit_code} ->
+      {:ok, error_output, exit_code} ->
         # Raw stderr at debug only (may contain ADC paths / account emails).
         Logger.debug(fn -> "GcpGcs: gcloud stderr: #{String.trim(error_output)}" end)
         Logger.error("GcpGcs: gcloud CLI auth failed (exit #{exit_code})")
@@ -183,12 +191,110 @@ defmodule GcpGcs.Auth do
            "gcloud CLI auth failed (exit #{exit_code})",
            {:gcloud_exit, exit_code}
          )}
+
+      :timeout ->
+        Logger.error("GcpGcs: gcloud CLI did not finish within #{timeout} ms; killed")
+
+        {:error,
+         Error.new(
+           :unauthenticated,
+           "gcloud CLI did not finish within #{timeout} ms",
+           :gcloud_timeout
+         )}
     end
   rescue
-    # System.cmd/3 raises ErlangError (e.g. `:enoent`) when gcloud can't be run.
+    # Port.open/2 raises ErlangError (e.g. `:enoent`) when gcloud can't be run.
     e in ErlangError ->
       Logger.error("GcpGcs: auth unavailable: gcloud could not be run (#{inspect(e.original)})")
       {:error, Error.new(:unauthenticated, "no authentication available", e)}
+  end
+
+  # Like System.cmd/3 with `stderr_to_stdout: true`, but with a deadline:
+  # System.cmd can't be cancelled, and killing its caller leaves the OS
+  # process running. Returns `{:ok, output, exit_status}` or `:timeout`.
+  #
+  # In the cache's fetch task (which traps exits) a shutdown from
+  # GcpGcs.TaskSupervisor also kills gcloud before the task exits.
+  defp run_gcloud(path, args, timeout) do
+    port =
+      Port.open(
+        {:spawn_executable, executable(path)},
+        [:binary, :exit_status, :stderr_to_stdout, :hide, args: args]
+      )
+
+    deadline = System.monotonic_time(:millisecond) + timeout
+    collect_gcloud(port, [], deadline, Process.whereis(GcpGcs.TaskSupervisor))
+  end
+
+  # A bare name is looked up on PATH only, like System.cmd/3 (never in the
+  # working directory); a path is used as given.
+  defp executable(path) do
+    cond do
+      String.contains?(path, "/") -> path
+      found = System.find_executable(path) -> found
+      true -> :erlang.error(:enoent)
+    end
+  end
+
+  defp collect_gcloud(port, output, deadline, supervisor) do
+    receive do
+      {^port, {:data, data}} ->
+        collect_gcloud(port, [output | data], deadline, supervisor)
+
+      {^port, {:exit_status, status}} ->
+        {:ok, IO.iodata_to_binary(output), status}
+
+      {:EXIT, ^supervisor, reason} ->
+        kill_gcloud(port)
+        exit(reason)
+    after
+      max(deadline - System.monotonic_time(:millisecond), 0) ->
+        kill_gcloud(port)
+        :timeout
+    end
+  end
+
+  # Port programs lead their own process group, so killing the group also
+  # stops processes gcloud started. The shell's builtin `kill` is used, so no
+  # `kill` executable is needed; the pid is passed as an argument, not
+  # interpolated. If the exit status is already queued, the process has been
+  # reaped (its pid may be reused) and is not signalled.
+  @kill_group "kill -9 -- -$1 2>/dev/null || kill -9 -$1 2>/dev/null || kill -9 $1 2>/dev/null"
+
+  defp kill_gcloud(port) do
+    with {:os_pid, os_pid} <- Port.info(port, :os_pid),
+         false <- exited?(port) do
+      System.cmd("/bin/sh", ["-c", @kill_group, "kill_gcloud", Integer.to_string(os_pid)])
+    end
+
+    close_port(port)
+  rescue
+    # No /bin/sh: nothing else can stop it; still close the port.
+    ErlangError -> close_port(port)
+  end
+
+  defp exited?(port) do
+    receive do
+      {^port, {:exit_status, _}} -> true
+    after
+      0 -> false
+    end
+  end
+
+  defp close_port(port) do
+    Port.close(port)
+    flush_port(port)
+  rescue
+    # The port closed on its own meanwhile.
+    ArgumentError -> flush_port(port)
+  end
+
+  defp flush_port(port) do
+    receive do
+      {^port, _} -> flush_port(port)
+    after
+      0 -> :ok
+    end
   end
 
   defp parse_gcloud_output(output) do

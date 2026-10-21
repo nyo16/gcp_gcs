@@ -15,7 +15,9 @@ defmodule GcpGcs.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       dialyzer: [
         plt_local_path: "priv/plts",
-        plt_core_path: "priv/plts"
+        plt_core_path: "priv/plts",
+        # CI runs dialyzer with MIX_ENV=test, which compiles test/support (ExUnit).
+        plt_add_apps: [:ex_unit]
       ],
 
       # Docs

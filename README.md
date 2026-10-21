@@ -217,9 +217,8 @@ config :gcp_gcs, :goth, MyApp.Goth
 ```
 
 ```elixir
-# Optional: tune the Finch pool (defaults: 10 connections per shard,
-# one shard per scheduler)
-config :gcp_gcs, :finch, pool_size: 10, pool_count: System.schedulers_online()
+# Optional: tune the Finch pool (defaults: one shard of 50 connections)
+config :gcp_gcs, :finch, pool_size: 50, pool_count: 1
 
 # Optional: HTTP/2 (opt-in; default HTTP/1)
 config :gcp_gcs, :finch, protocols: [:http2]
@@ -240,11 +239,23 @@ config :gcp_gcs, :retry, max_attempts: 4, base_delay: 200, max_delay: 10_000
 ```
 
 **Pool sizing:** every in-flight upload or download holds one connection for
-its whole duration, so `pool_size * pool_count` must cover your peak number of
-concurrent transfers plus metadata calls; otherwise callers wait up to
-`:pool_timeout` and then get `:resource_exhausted`. HTTP/2 multiplexes
+its whole duration, so `pool_size * pool_count` is your transfer concurrency
+and must cover the peak number of concurrent transfers plus metadata calls;
+otherwise callers wait up to `:pool_timeout` and then get
+`:resource_exhausted`. Raise `pool_size` first: Finch picks a shard at random
+per request, so several shards start queueing while one pool of the same
+total size still has free connections. HTTP/2 multiplexes
 requests over fewer connections; it relies on the mint ≥ 1.11 / hpax ≥ 1.1
 fixes pulled in by finch ≥ 0.24.
+
+**TLS:** HTTPS connections verify the server certificate against the OS trust
+store, which Mint loads at connect time (CAStore's bundle if the OS store is
+missing and `castore` is a dependency). The store is loaded once at
+application start, so a host without one fails at boot. If you override
+`config :gcp_gcs, :ssl_opts`, point at a bundle with `cacertfile:` rather than
+embedding a decoded `cacerts:` list: the options are copied with the
+connection on every pool checkout, so a large list costs hundreds of
+microseconds per request.
 
 Per call, every function accepts `:timeout`, `:pool_timeout`, `:retry`
 (`false` or overrides), `:finch`, `:goth` and `:base_url` (a per-call
@@ -276,9 +287,12 @@ The endpoint is resolved once at application start.
    development. Tokens are cached until shortly before their real expiry and
    fetched once under concurrent demand. Disable with
    `config :gcp_gcs, :gcloud_fallback, false`; pin the binary with
-   `config :gcp_gcs, :gcloud_path, "/path/to/gcloud"`.
+   `config :gcp_gcs, :gcloud_path, "/path/to/gcloud"`. A run that takes longer
+   than `config :gcp_gcs, :gcloud_timeout` (default 30 000 ms) is killed.
 
-A `401` response clears the cached token and retries the request once.
+A `401` response to an authenticated request is retried once with a fresh
+token: the rejected gcloud token is replaced (once, however many requests were
+rejected); Goth tokens are left to Goth.
 
 Using Goth:
 

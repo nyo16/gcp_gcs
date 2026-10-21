@@ -111,6 +111,11 @@ defmodule GcpGcs.UploadResumableTest do
       assert second.content_range == "bytes 40-99/100"
       assert second.body == binary_part(data, 40, 60)
       assert FakeResumable.data(server) == data
+
+      # Both reach the total, so both carry the (once computed) digest.
+      md5 = {"x-goog-hash", "md5=" <> Base.encode64(:crypto.hash(:md5, data))}
+      assert md5 in first.headers
+      assert md5 in second.headers
     end
   end
 
@@ -131,12 +136,16 @@ defmodule GcpGcs.UploadResumableTest do
       assert {:ok, _} =
                Upload.upload_stream(@bucket, "object.bin", split(data, 4096), chunk_size: @chunk)
 
-      [_first, failed, status, resent | _] = FakeResumable.puts(server)
+      [_first, failed, status, resent | _] = puts = FakeResumable.puts(server)
       assert failed.content_range == "bytes #{@chunk}-#{2 * @chunk - 1}/*"
       assert status.content_range == "bytes */*"
       assert status.body == ""
       assert resent.content_range == failed.content_range
       assert FakeResumable.data(server) == data
+
+      # Hashing survives the failed PUT and the recovery.
+      md5 = "md5=" <> Base.encode64(:crypto.hash(:md5, data))
+      assert {"x-goog-hash", md5} in List.last(puts).headers
     end
 
     @tag :tmp_dir
@@ -206,6 +215,105 @@ defmodule GcpGcs.UploadResumableTest do
       assert {"x-goog-hash", "md5=" <> Base.encode64(:crypto.hash(:md5, data))} in final.headers
     end
 
+    @tag :tmp_dir
+    test "a range re-read after the final one reached the server carries no hash", %{
+      fake: fake,
+      tmp_dir: tmp_dir
+    } do
+      # The final PUT is answered with a 308 that forgets everything, so
+      # upload_file starts over from byte 0 with intermediate ranges.
+      server =
+        FakeResumable.start(fake, fn
+          2, _req -> :forget
+          _i, _req -> :all
+        end)
+
+      data = input(2 * @chunk + 5)
+      path = Path.join(tmp_dir, "payload.bin")
+      File.write!(path, data)
+
+      assert {:ok, _} = Upload.upload_file(@bucket, "object.bin", path, chunk_size: @chunk)
+
+      [_, _, forgotten, reread | _] = puts = FakeResumable.puts(server)
+      assert forgotten.content_range == "bytes #{2 * @chunk}-#{2 * @chunk + 4}/#{byte_size(data)}"
+      assert reread.content_range == "bytes 0-#{@chunk - 1}/#{byte_size(data)}"
+      assert List.keyfind(reread.headers, "x-goog-hash", 0) == nil
+
+      md5 = "md5=" <> Base.encode64(:crypto.hash(:md5, data))
+      assert {"x-goog-hash", md5} in List.last(puts).headers
+      assert FakeResumable.data(server) == data
+    end
+
+    test "a failed upload leaves no hasher replies or monitors behind", %{fake: fake} do
+      FakeResumable.start(fake, fn
+        1, _req -> :forget
+        _i, _req -> :all
+      end)
+
+      {:monitors, monitors} = Process.info(self(), :monitors)
+
+      assert {:error, %Error{code: :data_loss}} =
+               Upload.upload_stream(@bucket, "object.bin", [input(3 * @chunk)],
+                 chunk_size: @chunk
+               )
+
+      refute_hasher_messages()
+      assert {:monitors, ^monitors} = Process.info(self(), :monitors)
+    end
+
+    test "a raising enumerable stops the hasher and leaves nothing behind", %{fake: fake} do
+      FakeResumable.start(fake)
+      {:monitors, monitors} = Process.info(self(), :monitors)
+      {:monitored_by, monitored_by} = Process.info(self(), :monitored_by)
+
+      # A full chunk is handed to the hasher before the enumerable raises.
+      enum = Stream.concat([input(@chunk + 1)], Stream.map([1], fn _ -> raise "boom" end))
+
+      assert_raise RuntimeError, "boom", fn ->
+        Upload.upload_stream(@bucket, "object.bin", enum, chunk_size: @chunk)
+      end
+
+      refute_hasher_messages()
+      assert {:monitors, ^monitors} = Process.info(self(), :monitors)
+      # The hasher (which monitors the uploader) is gone.
+      assert {:monitored_by, ^monitored_by} = Process.info(self(), :monitored_by)
+    end
+
+    test "an upload whose hasher dies exits instead of hanging", %{fake: fake} do
+      FakeResumable.start(fake)
+      test_pid = self()
+
+      uploader =
+        Task.async(fn ->
+          # Produced lazily, in the uploading process: by the second element
+          # the hasher exists (and has been handed the first chunk). It is
+          # the only plainly spawned process, besides the test process,
+          # monitoring the uploader.
+          enum =
+            Stream.map([1, 2, 3], fn
+              2 ->
+                {:monitored_by, pids} = Process.info(self(), :monitored_by)
+
+                hashers =
+                  for pid <- pids -- [test_pid],
+                      Process.info(pid, :initial_call) == {:initial_call, {:erlang, :apply, 2}},
+                      do: pid
+
+                send(test_pid, {:hashers, hashers})
+                Enum.each(hashers, &Process.exit(&1, :kill))
+                input(@chunk)
+
+              _ ->
+                input(@chunk)
+            end)
+
+          catch_exit(Upload.upload_stream(@bucket, "object.bin", enum, chunk_size: @chunk))
+        end)
+
+      assert {:ok, {:hasher_down, :killed}} = Task.yield(uploader, 5_000)
+      assert_received {:hashers, [_hasher]}
+    end
+
     test "checksum: false sends no hash", %{fake: fake} do
       server = FakeResumable.start(fake)
 
@@ -214,6 +322,12 @@ defmodule GcpGcs.UploadResumableTest do
 
       assert [put] = FakeResumable.puts(server)
       assert List.keyfind(put.headers, "x-goog-hash", 0) == nil
+    end
+
+    # Messages tagged by an upload's hasher: `{ref, :hashed}` / `{ref, :digest, _}`.
+    defp refute_hasher_messages do
+      refute_received {_tag, :hashed}
+      refute_received {_tag, :digest, _}
     end
   end
 

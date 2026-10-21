@@ -35,8 +35,11 @@ defmodule GcpGcs.Telemetry do
 
   ## Auth events
 
-  Token fetches emit `[:gcp_gcs, :auth, _]` with the same three suffixes.
-  Stop metadata includes `:source` (`:goth | :gcloud`) and `:result`.
+  `[:gcp_gcs, :auth, _]` (same three suffixes) is emitted when the gcloud
+  fallback actually runs `gcloud`: on a cache miss or refresh, not on cached
+  reads. Stop metadata includes `:source` (`:gcloud`) and `:result`. Goth
+  token reads are not reported here; Goth emits its own telemetry for its
+  refreshes.
 
   ## Example
 

@@ -7,8 +7,10 @@ defmodule GcpGcs.Validation do
   # Bucket naming: 3-63 chars, lowercase letters/digits/hyphens/underscores/dots,
   # must start and end with a letter or digit. (Dotted "domain-named" buckets up
   # to 222 chars exist but are rare; we keep the common-case rule strict.)
-  @bucket_regex ~r/^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/
-  @ip_regex ~r/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
+  #
+  # These checks run on every request: they use binary matching, not regexes.
+  defguardp lower_alnum?(c) when c in ?a..?z or c in ?0..?9
+  defguardp digit?(c) when c in ?0..?9
 
   @max_object_bytes 1024
 
@@ -25,7 +27,7 @@ defmodule GcpGcs.Validation do
   @spec validate_bucket(term()) :: {:ok, String.t()} | {:error, Error.t()}
   def validate_bucket(bucket) when is_binary(bucket) do
     cond do
-      not Regex.match?(@bucket_regex, bucket) ->
+      not bucket_name?(bucket) ->
         {:error,
          Error.new(
            :validation_error,
@@ -33,7 +35,7 @@ defmodule GcpGcs.Validation do
              "starting and ending with a letter or digit"
          )}
 
-      Regex.match?(@ip_regex, bucket) ->
+      ip_address?(bucket) ->
         {:error, Error.new(:validation_error, "bucket must not be an IP address")}
 
       String.starts_with?(bucket, "goog") ->
@@ -72,7 +74,7 @@ defmodule GcpGcs.Validation do
       not String.valid?(object) ->
         {:error, Error.new(:validation_error, "object name must be valid UTF-8")}
 
-      String.match?(object, ~r/[\x00-\x1F]/) ->
+      control_char?(object) ->
         {:error, Error.new(:validation_error, "object name must not contain control characters")}
 
       true ->
@@ -114,7 +116,7 @@ defmodule GcpGcs.Validation do
   def validate_header_value(nil, _field), do: {:ok, nil}
 
   def validate_header_value(value, field) when is_binary(value) do
-    if String.match?(value, ~r/\A[\x20-\x7E]+\z/),
+    if value != "" and printable_ascii?(value),
       do: {:ok, value},
       else: header_value_error(field)
   end
@@ -125,6 +127,42 @@ defmodule GcpGcs.Validation do
     {:error,
      Error.new(:validation_error, "#{field} must be a non-empty string of printable ASCII")}
   end
+
+  defp bucket_name?(<<first, rest::binary>> = name)
+       when byte_size(name) in 3..63 and lower_alnum?(first),
+       do: bucket_tail?(rest)
+
+  defp bucket_name?(_name), do: false
+
+  defp bucket_tail?(<<last>>) when lower_alnum?(last), do: true
+
+  defp bucket_tail?(<<c, rest::binary>>) when lower_alnum?(c) or c in [?., ?_, ?-],
+    do: bucket_tail?(rest)
+
+  defp bucket_tail?(_rest), do: false
+
+  # Four dot-separated groups of 1-3 digits.
+  defp ip_address?(name) do
+    case :binary.split(name, ".", [:global]) do
+      [_, _, _, _] = groups -> Enum.all?(groups, &(byte_size(&1) in 1..3 and digits?(&1)))
+      _ -> false
+    end
+  end
+
+  @doc false
+  # Non-empty and ASCII digits only.
+  @spec digits?(binary()) :: boolean()
+  def digits?(<<c>>) when digit?(c), do: true
+  def digits?(<<c, rest::binary>>) when digit?(c), do: digits?(rest)
+  def digits?(_), do: false
+
+  defp control_char?(<<c, _::binary>>) when c < 0x20, do: true
+  defp control_char?(<<_, rest::binary>>), do: control_char?(rest)
+  defp control_char?(<<>>), do: false
+
+  defp printable_ascii?(<<c, rest::binary>>) when c in 0x20..0x7E, do: printable_ascii?(rest)
+  defp printable_ascii?(<<>>), do: true
+  defp printable_ascii?(_), do: false
 
   @doc "Validates a bucket/object pair."
   @spec validate_location(term(), term()) :: {:ok, {String.t(), String.t()}} | {:error, Error.t()}

@@ -21,7 +21,10 @@ defmodule GcpGcs.Download do
   @doc """
   Downloads an object and returns its full contents as a binary.
 
-  Prefer `download_to_file/4` or `stream/5` for large objects.
+  The body is buffered and then flattened into that one binary, so peak
+  memory is about twice the object size. For large objects use
+  `download_to_file/4` or `stream/5` (`GcpGcs.download_stream/5`), which use
+  constant memory.
 
   ## Options
   - `:generation` — a specific object generation
@@ -75,13 +78,24 @@ defmodule GcpGcs.Download do
       result =
         try do
           stream_media(bucket, object, opts, {io, :ok}, &write_chunk/2)
-        after
-          File.close(io)
+        catch
+          kind, reason ->
+            _ = File.close(io)
+            :erlang.raise(kind, reason, __STACKTRACE__)
         end
 
-      finish_to_file(result, part, path)
+      result
+      |> closed(File.close(io))
+      |> finish_to_file(part, path)
     end
   end
+
+  # Writes are buffered (delayed_write), so a write error can first surface
+  # when the file is closed: a download is only complete once that succeeds.
+  defp closed({:ok, {status, headers, {device, :ok}}}, {:error, reason}),
+    do: {:ok, {status, headers, {device, {:io_error, reason}}}}
+
+  defp closed(result, _close_result), do: result
 
   # Accumulator is `{device, :ok | {:io_error, reason}}`; the first failed
   # write stops reading the body.
@@ -218,8 +232,11 @@ defmodule GcpGcs.Download do
      )}
   end
 
+  # Raw and buffered: the reducer that writes runs in this process (which owns
+  # the raw file), and 1 MiB batches replace a file-server message and a
+  # write(2) per ~16 KiB body chunk.
   defp open_file(path) do
-    case File.open(path, [:write, :binary]) do
+    case File.open(path, [:raw, :write, :binary, {:delayed_write, 1_048_576, 2_000}]) do
       {:ok, io} ->
         {:ok, io}
 

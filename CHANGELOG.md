@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:src_object`, replacing `:dst_bucket` / `:dst_object`). New spans for
   `start_resumable_upload/3` and `upload_chunk/3`. The event name
   `[:gcp_gcs, :request]` is unchanged and documented as operation-scoped.
+- **Auth telemetry**: `[:gcp_gcs, :auth, _]` is emitted only when the gcloud
+  fallback runs `gcloud` (cache miss or refresh). Goth token reads no longer
+  emit it on every request; use Goth's own telemetry for its refreshes.
 - **Error vocabulary**: client-side protocol violations (missing `Location`,
   malformed `Range`, no progress, unexpected rewrite response) use the new
   code `:protocol_error` instead of `:internal`, which now only means HTTP
@@ -44,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are internal.
 - **List results**: `list_buckets/2` pages no longer contain `prefixes`
   (only object listings have them).
-- **Stricter validation**: bucket names with `..`, `.-` or `-.`, object names
+- **Stricter validation**: bucket names with `..`, `.-` or `-.` (or a
+  trailing newline, which the old pattern let through), object names
   with C0 control characters or invalid UTF-8, and `:origin` /
   `:content_type` values that are not printable ASCII are rejected with
   `:validation_error` before any request (previously a GCS 400 or a Mint
@@ -52,8 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Retries are on by default** for idempotent requests (see Added). Pass
   `retry: false` or `config :gcp_gcs, :retry, max_attempts: 1` for the old
   behaviour.
-- **Default pool**: `pool_count` defaults to `System.schedulers_online()` with
-  10 connections per shard (was one shard of 25).
+- **Default pool**: one shard of 50 connections (`pool_size: 50,
+  pool_count: 1`; was one shard of 25). A single pool queues later than
+  several randomly chosen shards of the same total size.
 - **Goth tokens are no longer cached in ETS** — Goth caches them itself.
 - After a resumable session exists, an error's `details` is
   `%{session_uri: uri, cause: original_details}`.
@@ -64,8 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config :gcp_gcs, :start_finch, false` to use your own Finch instance.
 - Bounded retries with exponential backoff and full jitter for idempotent
   requests on 408/429/5xx and dropped connections, honouring `Retry-After`
-  (`config :gcp_gcs, :retry`, per-call `:retry`). A 401 clears the token
-  cache and retries once.
+  (`config :gcp_gcs, :retry`, per-call `:retry`). A 401 to an authenticated
+  request is retried once with a fresh token; only the rejected gcloud token
+  is replaced, so concurrent 401s cause a single refetch.
 - Resumable uploads recover from transient failures by querying the session
   and resuming from the persisted offset; `upload_file/4` now uploads in
   chunks read with `pread` (8 MiB by default) and can resume from any offset.
@@ -85,7 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - gcloud auth: tokens are cached until shortly before their real expiry
   (refreshed at 80% of the TTL), fetched once under concurrent demand, and
   failures are cached for 5 s; `config :gcp_gcs, :gcloud_path` and
-  `config :gcp_gcs, :gcloud_fallback, false`.
+  `config :gcp_gcs, :gcloud_fallback, false`. The fetch runs outside the
+  cache process, so waiting callers don't queue in its mailbox, and
+  `clear_auth_cache/0` returns at once (callers after it fetch anew, even
+  while an older fetch is still running); `config :gcp_gcs, :gcloud_timeout`
+  (default 30 s) kills a gcloud run that hangs, with its child processes,
+  also when the application stops. A bare `:gcloud_path` is looked up on
+  `PATH` only.
 - `:request_timeout` (overall deadline for metadata calls), opt-in HTTP/2
   via `config :gcp_gcs, :finch, protocols: [:http2]`, `@spec`s on every
   `GcpGcs` function.
@@ -93,6 +105,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - The endpoint (emulator or production) is resolved once at application
   start. Finch's `:default` pool uses the same strict TLS settings.
+- HTTPS pools no longer embed the decoded OS CA store in their TLS options;
+  Mint loads it at connect time. Finch copied those options with the
+  connection on every pool checkout (~0.5 ms per request). The store is still
+  loaded once at start, so a host without one (and without `castore`) fails
+  at boot.
+- Faster transfers: the resumable-upload MD5 is computed in a per-upload
+  process while chunks are sent (~1.5× client-side throughput with
+  `checksum: true`); `upload_stream/4` no longer copies chunk-aligned
+  elements; `download_to_file/4` writes through a raw, buffered file (~40%
+  less CPU).
 - Non-2xx download bodies are buffered up to 64 KiB for the error.
 - The token cache table is `:protected`; only its owner process writes it.
 
@@ -109,8 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    failures should match `:protocol_error`.
 5. Replace direct calls to GcpGcs.Client, GcpGcs.Auth's `get_token` /
    `request_headers`, or GcpGcs.Config functions; they are internal now.
-6. If you relied on a single 25-connection pool, set
-   `config :gcp_gcs, :finch, pool_size: 25, pool_count: 1`.
+6. The pool now has 50 connections in one shard (was 25). To keep the old
+   size, set `config :gcp_gcs, :finch, pool_size: 25`.
 7. If writes must never be retried at all, set
    `config :gcp_gcs, :retry, max_attempts: 1` (non-idempotent requests are
    never retried by default anyway).

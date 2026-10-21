@@ -20,8 +20,9 @@ defmodule GcpGcs.Client do
   # `idempotent: true`) are retried on 408, 429, 500, 502, 503 and 504
   # responses and on closed, timed-out or refused connections, with
   # exponential backoff and full jitter, honouring Retry-After. Streams are
-  # retried only while the reducer has not been called. A 401 on an
-  # authenticated request clears the token cache and is retried once.
+  # retried only while the reducer has not been called. A 401 to a request
+  # that carried a bearer token is retried once with a token other than the
+  # rejected one (see GcpGcs.Auth.request_headers/2).
 
   alias GcpGcs.{Auth, Config, Error}
 
@@ -89,7 +90,7 @@ defmodule GcpGcs.Client do
           {:ok, non_neg_integer(), headers(), term()} | {:error, Error.t()}
   def exchange(method, path, opts \\ []) do
     url = url(path, opts)
-    outcome = with_retries(method, opts, fn -> exchange_attempt(method, url, opts) end)
+    outcome = with_retries(method, opts, &exchange_attempt(method, url, opts, &1))
 
     case outcome do
       {:response, status, headers, body} ->
@@ -124,8 +125,7 @@ defmodule GcpGcs.Client do
   def stream(method, path, opts, acc, reducer) when is_function(reducer, 2) do
     url = url(path, opts)
 
-    outcome =
-      with_retries(method, opts, fn -> stream_attempt(method, url, opts, acc, reducer) end)
+    outcome = with_retries(method, opts, &stream_attempt(method, url, opts, acc, reducer, &1))
 
     case outcome do
       {:response, status, headers, user_acc} when status in 200..299 ->
@@ -143,8 +143,8 @@ defmodule GcpGcs.Client do
   end
 
   # One attempt of exchange/3, as a retry outcome (see with_retries/3).
-  defp exchange_attempt(method, url, opts) do
-    with {:ok, auth_headers} <- auth_headers(opts) do
+  defp exchange_attempt(method, url, opts, stale_token) do
+    with {:ok, auth_headers} <- auth_headers(opts, stale_token) do
       {body_iodata, body_headers} = encode_body(Keyword.get(opts, :body))
       headers = auth_headers ++ body_headers ++ Keyword.get(opts, :headers, [])
       request = Finch.build(method, url, headers, body_iodata)
@@ -152,6 +152,7 @@ defmodule GcpGcs.Client do
       request
       |> checkout_safe(&Finch.request(&1, finch(opts), request_opts(opts)))
       |> exchange_outcome()
+      |> tag_unauthorized(auth_headers)
     end
   end
 
@@ -163,8 +164,8 @@ defmodule GcpGcs.Client do
 
   # One attempt of stream/5, as a retry outcome. The payload of a 2xx is the
   # user accumulator, otherwise the (capped) error body.
-  defp stream_attempt(method, url, opts, acc, reducer) do
-    with {:ok, auth_headers} <- auth_headers(opts) do
+  defp stream_attempt(method, url, opts, acc, reducer, stale_token) do
+    with {:ok, auth_headers} <- auth_headers(opts, stale_token) do
       request = Finch.build(method, url, auth_headers ++ Keyword.get(opts, :headers, []))
       # {phase, status, headers, user_acc, {error_chunks, error_bytes}}
       init = {:status, nil, [], acc, {[], 0}}
@@ -173,6 +174,7 @@ defmodule GcpGcs.Client do
       request
       |> checkout_safe(&Finch.stream_while(&1, finch(opts), init, step, stream_opts(opts)))
       |> stream_outcome()
+      |> tag_unauthorized(auth_headers)
     end
   end
 
@@ -186,6 +188,17 @@ defmodule GcpGcs.Client do
 
   defp stream_outcome({:error, reason, {phase, _, _, _, _}}),
     do: {:transport_error, reason, phase == :ok}
+
+  # A 401 to a request that carried a bearer token: retry_loop/4 retries once,
+  # telling the auth layer which token was rejected.
+  defp tag_unauthorized({:response, 401, _headers, _payload} = outcome, auth_headers) do
+    case List.keyfind(auth_headers, "authorization", 0) do
+      {_, sent_token} -> {:unauthorized, sent_token, outcome}
+      nil -> outcome
+    end
+  end
+
+  defp tag_unauthorized(outcome, _auth_headers), do: outcome
 
   @doc false
   # The caller options that domain modules forward to the transport.
@@ -216,31 +229,41 @@ defmodule GcpGcs.Client do
 
   # Retries --------------------------------------------------------------------
 
-  # `attempt` returns an outcome: {:response, status, headers, payload},
+  # `attempt` takes the bearer token the previous attempt was rejected with
+  # (nil otherwise) and returns an outcome: {:response, status, headers,
+  # payload}, {:unauthorized, sent_token, response_outcome},
   # {:transport_error, reason, reducer_touched?} or {:error, %Error{}}.
+  #
+  # `auth` is `:fresh`, `{:stale, token}` (the attempt right after a 401) or
+  # `:reauthed` (later attempts: the token was already replaced once).
   defp with_retries(method, opts, attempt) do
-    policy = retry_policy(method, opts)
-    reauth? = Keyword.get(opts, :auth, true) != false
-    retry_loop(attempt, policy, 1, reauth?)
+    retry_loop(attempt, retry_policy(method, opts), 1, :fresh)
   end
 
-  defp retry_loop(attempt, policy, n, reauth?) do
-    outcome = attempt.()
+  defp retry_loop(attempt, policy, n, auth) do
+    case attempt.(stale_token(auth)) do
+      {:unauthorized, sent_token, outcome} ->
+        # The token may have been revoked or rotated: retry once with
+        # another one. A second 401 is final.
+        if auth == :fresh,
+          do: retry_loop(attempt, policy, n, {:stale, sent_token}),
+          else: outcome
 
-    cond do
-      reauth? and match?({:response, 401, _, _}, outcome) ->
-        # The cached token may have been revoked or rotated: refetch once.
-        :ok = Auth.clear_cache()
-        retry_loop(attempt, policy, n, false)
-
-      retryable?(outcome) and policy != nil and n < policy[:max_attempts] ->
-        Process.sleep(delay(outcome, policy, n))
-        retry_loop(attempt, policy, n + 1, reauth?)
-
-      true ->
-        outcome
+      outcome ->
+        if retryable?(outcome) and policy != nil and n < policy[:max_attempts] do
+          Process.sleep(delay(outcome, policy, n))
+          retry_loop(attempt, policy, n + 1, after_attempt(auth))
+        else
+          outcome
+        end
     end
   end
+
+  defp stale_token({:stale, token}), do: token
+  defp stale_token(_auth), do: nil
+
+  defp after_attempt(:fresh), do: :fresh
+  defp after_attempt(_auth), do: :reauthed
 
   defp retry_policy(method, opts) do
     if method in [:get, :head] or Keyword.get(opts, :idempotent) == true,
@@ -411,9 +434,9 @@ defmodule GcpGcs.Client do
 
   defp url(absolute, opts), do: append_query(absolute, Keyword.get(opts, :query))
 
-  defp auth_headers(opts) do
+  defp auth_headers(opts, stale_token) do
     if Keyword.get(opts, :auth, true) do
-      Auth.request_headers(opts)
+      Auth.request_headers(opts, stale_token)
     else
       {:ok, []}
     end

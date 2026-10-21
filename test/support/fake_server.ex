@@ -125,11 +125,15 @@ defmodule GcpGcs.FakeServer.Plug do
 
   alias GcpGcs.FakeServer
 
+  # Opts must be a Plug.opts() term (a bare pid isn't one), so the state
+  # Agent travels as `state: pid`.
   @impl true
-  def init(state), do: state
+  def init(state), do: [state: state]
 
   @impl true
-  def call(conn, state) do
+  def call(conn, opts) do
+    state = Keyword.fetch!(opts, :state)
+
     case FakeServer.claim(state, conn.method, conn.request_path) do
       {:ok, fun} ->
         run(fun, conn, state)

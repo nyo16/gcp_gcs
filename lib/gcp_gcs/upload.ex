@@ -146,6 +146,11 @@ defmodule GcpGcs.Upload do
   the total size need not be known up front and memory stays bounded (about
   one chunk plus the largest element).
 
+  The enumerable is consumed in the calling process. With `checksum: true`
+  the MD5 is computed by a helper process that replies to the caller, so an
+  enumerable must not consume messages it doesn't own (e.g. a catch-all
+  `receive`).
+
   ## Options
   - `:content_type` — defaults to `"application/octet-stream"`
   - `:chunk_size` — chunk size in bytes (rounded to a 256 KiB multiple)
@@ -164,8 +169,7 @@ defmodule GcpGcs.Upload do
            {:ok, _} <- Validation.validate_enumerable(enum, "source"),
            {:ok, session} <- start_session(bucket, object, opts) do
         session
-        |> transfer(opts)
-        |> stream_to_session(enum, chunk_size(opts))
+        |> with_transfer(opts, &stream_to_session(&1, enum, chunk_size(opts)))
         |> with_session(session)
       end
     end)
@@ -360,8 +364,7 @@ defmodule GcpGcs.Upload do
   defp resumable_put(bucket, object, data, opts) do
     with {:ok, session} <- start_session(bucket, object, opts) do
       session
-      |> transfer(opts)
-      |> finalize(0, data)
+      |> with_transfer(opts, &finalize(&1, 0, data))
       |> with_session(session)
     end
   end
@@ -378,8 +381,7 @@ defmodule GcpGcs.Upload do
   defp upload_file_body(bucket, object, path, size, opts) do
     with {:ok, session} <- start_session(bucket, object, opts) do
       session
-      |> transfer(opts)
-      |> file_to_session(path, size, chunk_size(opts))
+      |> with_transfer(opts, &file_to_session(&1, path, size, chunk_size(opts)))
       |> with_session(session)
     end
   end
@@ -415,26 +417,37 @@ defmodule GcpGcs.Upload do
   #   * `stalled?` — the previous 308 made no progress; one stall is
   #     tolerated (e.g. a 308 without `Range` on the first chunk: nothing
   #     persisted, resend it), a second consecutive one is an error
-  #   * `hash` — `{md5_ctx, hashed_upto}` over the bytes sent so far, or nil
+  #   * `hash` — the integrity hash state (see "Integrity hash"), or nil
 
-  defp transfer(session, opts) do
-    %{
+  # Runs `fun` with the state of a new transfer; the hasher never outlives it.
+  defp with_transfer(session, opts, fun) do
+    t = %{
       session: session,
       opts: opts,
       policy: Client.retry_policy(opts),
       failures: 0,
       stalled?: false,
-      hash: if(Keyword.get(opts, :checksum, true), do: {:crypto.hash_init(:md5), 0})
+      hash: if(Keyword.get(opts, :checksum, true), do: start_hasher())
     }
+
+    try do
+      fun.(t)
+    after
+      stop_hasher(t.hash)
+    end
   end
 
   # Sends bytes `offset..offset + byte_size(data) - 1`. Returns
   # `{:resume, persisted, t}`, `{:ok, object}` or `{:error, error}`.
   defp send_range(t, offset, data, total) do
-    t = advance_hash(t, offset, data)
-    extra = hash_header(t, offset + byte_size(data), total)
+    sent_end = offset + byte_size(data)
 
-    case put_session(t.session, data, offset, total, t.opts, extra) do
+    t =
+      if sent_end == total,
+        do: finish_hash(t, offset, data),
+        else: advance_hash(t, offset, data)
+
+    case put_session(t.session, data, offset, total, t.opts, hash_header(t, sent_end, total)) do
       {:resume, persisted} -> {:resume, persisted, t}
       {:ok, object} -> {:ok, object}
       {:error, %Error{} = error} -> recover(t, total, error)
@@ -486,7 +499,9 @@ defmodule GcpGcs.Upload do
     result =
       Enum.reduce_while(enum, {:ok, t, 0, ""}, fn
         data, {:ok, t, offset, buf} when is_binary(data) ->
-          case flush_chunks(t, offset, buf <> data, chunk) do
+          # With an empty buffer the element itself is chunked, so aligned
+          # chunks are sub-binaries of it rather than copies.
+          case flush_chunks(t, offset, prepend(buf, data), chunk) do
             {:ok, t, offset, rest} -> {:cont, {:ok, t, offset, rest}}
             {:error, %Error{}} = error -> {:halt, error}
           end
@@ -625,23 +640,122 @@ defmodule GcpGcs.Upload do
   end
 
   # Integrity hash -------------------------------------------------------------
+  #
+  # MD5 runs at roughly network speed, so a per-transfer hasher process
+  # computes it while the caller sends. Each range's not-yet-hashed bytes are
+  # handed over just before its PUT (refc binaries: shared, not copied), and
+  # the hasher's acknowledgement is awaited only before the next range is
+  # handed over. Hashing a range therefore overlaps its PUT and the
+  # reading/buffering of the next one, while at most one range is queued.
+  # Resent bytes are hashed once (`upto`). The final range is hashed before
+  # it is sent because its request carries the digest.
+  #
+  # Replies are matched by `tag` in the caller's mailbox (one receive per
+  # range), so callers whose mailbox is backed up pay a scan per range, and
+  # an enumerable that consumes arbitrary messages would steal them.
+  #
+  # State: %{pid, mref, tag, upto, pending?, digest}.
 
-  # Hashes the part of `data` past what has been hashed already (resent bytes
-  # are hashed once).
-  defp advance_hash(%{hash: {ctx, upto}} = t, offset, data)
+  defp start_hasher do
+    owner = self()
+    tag = make_ref()
+    # In the caller, so an unavailable MD5 (e.g. a FIPS build) raises here.
+    ctx = :crypto.hash_init(:md5)
+    {pid, mref} = spawn_monitor(fn -> hasher_loop(owner, Process.monitor(owner), tag, ctx) end)
+    %{pid: pid, mref: mref, tag: tag, upto: 0, pending?: false, digest: nil}
+  end
+
+  defp hasher_loop(owner, owner_ref, tag, ctx) do
+    receive do
+      {^tag, :update, data} ->
+        ctx = :crypto.hash_update(ctx, data)
+        send(owner, {tag, :hashed})
+        # Drop this process's reference to the chunk now, not at some later GC.
+        :erlang.garbage_collect()
+        hasher_loop(owner, owner_ref, tag, ctx)
+
+      {^tag, :final, data} ->
+        send(owner, {tag, :digest, ctx |> :crypto.hash_update(data) |> :crypto.hash_final()})
+
+      {:DOWN, ^owner_ref, _, _, _} ->
+        :ok
+    end
+  end
+
+  # Kills the hasher and drops any reply it sent. The original monitor's
+  # :DOWN may already have been consumed (a hasher that died mid-transfer),
+  # so a fresh monitor is waited on: it fires at once, with :noproc, if the
+  # hasher is gone. Everything the hasher sent precedes that :DOWN, so
+  # nothing can arrive after the flush.
+  defp stop_hasher(nil), do: :ok
+
+  defp stop_hasher(%{pid: pid, mref: mref, tag: tag}) do
+    Process.demonitor(mref, [:flush])
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+
+    receive do
+      {:DOWN, ^ref, _, _, _} -> :ok
+    end
+
+    flush_hasher(tag)
+  end
+
+  defp flush_hasher(tag) do
+    receive do
+      {^tag, :hashed} -> flush_hasher(tag)
+      {^tag, :digest, _} -> flush_hasher(tag)
+    after
+      0 -> :ok
+    end
+  end
+
+  # Hands the part of an intermediate range past `upto` to the hasher.
+  defp advance_hash(%{hash: %{upto: upto} = hash} = t, offset, data)
        when offset <= upto and offset + byte_size(data) > upto do
-    new = binary_part(data, upto - offset, offset + byte_size(data) - upto)
-    %{t | hash: {:crypto.hash_update(ctx, new), offset + byte_size(data)}}
+    hash = await_hashed(hash)
+    send(hash.pid, {hash.tag, :update, unhashed(data, offset, upto)})
+    %{t | hash: %{hash | upto: offset + byte_size(data), pending?: true}}
   end
 
   defp advance_hash(t, _offset, _data), do: t
 
-  # The final request (it reaches the known total) carries the whole-object MD5.
-  defp hash_header(%{hash: {ctx, total}}, total, total) do
-    [{"x-goog-hash", "md5=" <> Base.encode64(:crypto.hash_final(ctx))}]
+  # The final range: hashes what is left and keeps the digest (a resent
+  # final range reuses it).
+  defp finish_hash(%{hash: %{digest: nil, upto: upto} = hash} = t, offset, data)
+       when offset <= upto and offset + byte_size(data) >= upto do
+    %{pid: pid, mref: mref, tag: tag} = hash = await_hashed(hash)
+    send(pid, {tag, :final, unhashed(data, offset, upto)})
+
+    digest =
+      receive do
+        {^tag, :digest, digest} -> digest
+        {:DOWN, ^mref, _, _, reason} -> exit({:hasher_down, reason})
+      end
+
+    %{t | hash: %{hash | upto: offset + byte_size(data), digest: digest}}
   end
 
-  defp hash_header(_t, _end, _total), do: []
+  defp finish_hash(t, _offset, _data), do: t
+
+  defp await_hashed(%{pending?: false} = hash), do: hash
+
+  defp await_hashed(%{mref: mref, tag: tag} = hash) do
+    receive do
+      {^tag, :hashed} -> %{hash | pending?: false}
+      {:DOWN, ^mref, _, _, reason} -> exit({:hasher_down, reason})
+    end
+  end
+
+  defp unhashed(data, offset, upto),
+    do: binary_part(data, upto - offset, offset + byte_size(data) - upto)
+
+  # Only a request that reaches the known total carries the whole-object MD5
+  # (not a range re-read after the server reports less progress).
+  defp hash_header(%{hash: %{digest: digest}}, total, total) when is_binary(digest),
+    do: [{"x-goog-hash", "md5=" <> Base.encode64(digest)}]
+
+  defp hash_header(_t, _sent_end, _total), do: []
 
   # Helpers --------------------------------------------------------------------
 
@@ -683,11 +797,16 @@ defmodule GcpGcs.Upload do
         {:ok, 0}
 
       value ->
-        case Regex.run(~r/\A(?:bytes=)?0-(\d+)\z/, String.trim(value)) do
-          [_, last] -> {:ok, String.to_integer(last) + 1}
-          nil -> :error
+        case String.trim(value) do
+          "bytes=0-" <> last -> persisted_end(last)
+          "0-" <> last -> persisted_end(last)
+          _ -> :error
         end
     end
+  end
+
+  defp persisted_end(last) do
+    if Validation.digits?(last), do: {:ok, String.to_integer(last) + 1}, else: :error
   end
 
   @doc false

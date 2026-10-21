@@ -31,17 +31,39 @@ defmodule GcpGcs.Config do
   ## Finch pool
 
       config :gcp_gcs, :finch,
-        pool_size: 10,                        # connections per shard
-        pool_count: System.schedulers_online(), # shards
-        protocols: [:http1]                   # opt in to [:http2] explicitly
+        pool_size: 50,          # connections per shard
+        pool_count: 1,          # shards
+        protocols: [:http1]     # opt in to [:http2] explicitly
 
       # Use your own Finch instance instead of the one GcpGcs starts:
       config :gcp_gcs, :start_finch, false
       config :gcp_gcs, :finch_name, MyApp.Finch
 
   Concurrent transfers each hold a connection for their whole duration, so
-  size the pool (`pool_size * pool_count`) for the number of simultaneous
-  uploads/downloads plus metadata calls.
+  `pool_size * pool_count` is the transfer concurrency: size it for the
+  number of simultaneous uploads/downloads plus metadata calls. Raise
+  `pool_size` first. Finch picks a shard at random per request, so several
+  shards start queueing (and returning `:resource_exhausted` after
+  `:pool_timeout`) while one shard of the same total size still has free
+  connections; add shards only if a single pool process becomes a
+  bottleneck (well beyond 1,000 requests per second).
+
+  ## TLS
+
+  HTTPS pools use `verify: :verify_peer` with TLS 1.2/1.3. Mint loads the OS
+  trust store (`:public_key.cacerts_get/0`) when it connects, or CAStore's
+  bundle if the OS store is unavailable and `castore` is a dependency. The
+  store is loaded once at application start, which fails if neither is
+  available. To replace these options (then nothing is checked at start):
+
+      config :gcp_gcs, :ssl_opts,
+        verify: :verify_peer,
+        cacertfile: "/etc/ssl/certs/ca-certificates.crt"
+
+  Prefer `:cacertfile` (or no CA option at all) over a decoded `:cacerts`
+  list: Finch keeps these options in every pool shard and copies them with
+  the connection on every checkout and checkin, so a large `:cacerts` list
+  adds hundreds of microseconds to each request.
 
   ## Timeouts
 
@@ -69,8 +91,13 @@ defmodule GcpGcs.Config do
 
       config :gcp_gcs, :gcloud_path, "/usr/local/bin/gcloud"  # default: "gcloud" on PATH
       config :gcp_gcs, :gcloud_fallback, false                # disable it entirely
+      config :gcp_gcs, :gcloud_timeout, 30_000                # ms per gcloud run
 
-  The gcloud fallback is meant for development; production deployments should
+  A bare `:gcloud_path` name is looked up on `PATH` only (never in the working
+  directory). `:gcloud_timeout` is a positive integer; a gcloud run that
+  exceeds it is killed (with any child processes) and the request fails with
+  `:unauthenticated`; that failure is cached for 5 seconds like any other. The
+  gcloud fallback is meant for development; production deployments should
   use Goth (`config :gcp_gcs, :goth, MyApp.Goth`).
 
   ## Per-call overrides
@@ -86,8 +113,9 @@ defmodule GcpGcs.Config do
   @default_timeout 30_000
   @default_pool_timeout 5_000
   @default_finch_name GcpGcs.Finch
-  @default_pool_size 10
+  @default_pool_size 50
   @default_retry [max_attempts: 4, base_delay: 200, max_delay: 10_000]
+  @default_gcloud_timeout 30_000
 
   @type emulator :: %{scheme: String.t(), host: String.t(), port: pos_integer()}
 
@@ -127,6 +155,25 @@ defmodule GcpGcs.Config do
   @doc false
   @spec gcloud_fallback?() :: boolean()
   def gcloud_fallback?, do: Application.get_env(:gcp_gcs, :gcloud_fallback, true)
+
+  @doc false
+  # Deadline (ms) for one gcloud run; the process is killed when it expires.
+  # Anything but a positive integer falls back to the default, with a warning.
+  @spec gcloud_timeout() :: pos_integer()
+  def gcloud_timeout do
+    case Application.get_env(:gcp_gcs, :gcloud_timeout, @default_gcloud_timeout) do
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      other ->
+        Logger.warning(
+          "GcpGcs: :gcloud_timeout must be a positive integer (ms), got #{inspect(other)}; " <>
+            "using #{@default_gcloud_timeout}"
+        )
+
+        @default_gcloud_timeout
+    end
+  end
 
   # The endpoint is resolved from app env / STORAGE_EMULATOR_HOST once, at
   # application start, and served from :persistent_term on every request.
@@ -260,7 +307,7 @@ defmodule GcpGcs.Config do
     pool =
       [
         size: Keyword.get(finch, :pool_size, @default_pool_size),
-        count: Keyword.get(finch, :pool_count, System.schedulers_online())
+        count: Keyword.get(finch, :pool_count, 1)
       ] ++ protocols(finch)
 
     # The :default entry covers origins other than the endpoint (e.g. a
@@ -283,10 +330,47 @@ defmodule GcpGcs.Config do
     end
   end
 
-  # Strict TLS for HTTPS: verify the server certificate against the OS trust
-  # store. The whole point of this client is authenticated requests carrying
-  # OAuth bearer tokens, so we never want an unverified connection. Override
-  # via `config :gcp_gcs, :ssl_opts, [...]`. No TLS options for plaintext
+  @doc false
+  # Loads the trust store Mint will use (OTP caches it), so a host without
+  # one fails at boot rather than on every HTTPS request. Skipped when
+  # `:ssl_opts` is configured: the CA options are the application's then.
+  @spec check_trust_store!() :: :ok
+  def check_trust_store! do
+    if Application.get_env(:gcp_gcs, :ssl_opts) do
+      :ok
+    else
+      _ = :public_key.cacerts_get()
+      :ok
+    end
+  rescue
+    e ->
+      if Code.ensure_loaded?(CAStore) do
+        Logger.warning(
+          "GcpGcs: no OS trust store (#{inspect(e.__struct__)}); Mint will use CAStore"
+        )
+
+        :ok
+      else
+        reraise RuntimeError,
+                [
+                  message:
+                    "GcpGcs: no OS CA trust store is available for HTTPS certificate " <>
+                      "verification (#{Exception.message(e)}). Install the OS CA certificates, " <>
+                      "add :castore to your dependencies, or set `config :gcp_gcs, :ssl_opts` " <>
+                      "with a :cacertfile."
+                ],
+                __STACKTRACE__
+      end
+  end
+
+  # Strict TLS for HTTPS: verify the server certificate. With no `:cacerts` or
+  # `:cacertfile` given, Mint loads the OS trust store
+  # (`:public_key.cacerts_get/0`) at connect time. Keeping the decoded
+  # certificates out of these options matters: Finch stores them in every pool
+  # shard and copies them with the connection on every checkout and checkin.
+  # The whole point of this client is authenticated requests carrying OAuth
+  # bearer tokens, so we never want an unverified connection. Override via
+  # `config :gcp_gcs, :ssl_opts, [...]`. No TLS options for plaintext
   # emulator endpoints.
   defp conn_opts(:https) do
     ssl =
@@ -294,7 +378,6 @@ defmodule GcpGcs.Config do
         :gcp_gcs,
         :ssl_opts,
         verify: :verify_peer,
-        cacerts: :public_key.cacerts_get(),
         versions: [:"tlsv1.2", :"tlsv1.3"]
       )
 
