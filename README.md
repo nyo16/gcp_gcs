@@ -191,8 +191,16 @@ config :gcp_gcs, :goth, MyApp.Goth
 ```
 
 ```elixir
-# Optional: tune the Finch pool
-config :gcp_gcs, :finch, pool_size: 50, pool_count: 1
+# Optional: tune the Finch pool (defaults: 10 connections per shard,
+# one shard per scheduler)
+config :gcp_gcs, :finch, pool_size: 10, pool_count: System.schedulers_online()
+
+# Optional: HTTP/2 (opt-in; default HTTP/1)
+config :gcp_gcs, :finch, protocols: [:http2]
+
+# Optional: bring your own Finch instance
+config :gcp_gcs, :start_finch, false
+config :gcp_gcs, :finch_name, MyApp.Finch
 
 # Optional: default request timeout (ms)
 config :gcp_gcs, :default_timeout, 30_000
@@ -200,7 +208,22 @@ config :gcp_gcs, :default_timeout, 30_000
 # Optional: max wait for a pooled connection (ms); exceeding it returns
 # {:error, %GcpGcs.Error{code: :resource_exhausted}}
 config :gcp_gcs, :pool_timeout, 5_000
+
+# Optional: retries for idempotent requests (and resumable-upload recovery)
+config :gcp_gcs, :retry, max_attempts: 4, base_delay: 200, max_delay: 10_000
 ```
+
+**Pool sizing:** every in-flight upload or download holds one connection for
+its whole duration, so `pool_size * pool_count` must cover your peak number of
+concurrent transfers plus metadata calls; otherwise callers wait up to
+`:pool_timeout` and then get `:resource_exhausted`. HTTP/2 multiplexes
+requests over fewer connections; it relies on the mint ≥ 1.11 / hpax ≥ 1.1
+fixes pulled in by finch ≥ 0.24.
+
+Per call, every function accepts `:timeout`, `:pool_timeout`, `:retry`
+(`false` or overrides), `:finch`, `:goth` and `:base_url` (a per-call
+endpoint, which keeps authentication on). Metadata calls also accept
+`:request_timeout`, an overall deadline.
 
 ### Development / test (emulator)
 
@@ -212,14 +235,24 @@ config :gcp_gcs, :emulator,
 ```
 
 `STORAGE_EMULATOR_HOST` (used by Google's own client libraries) is also
-honored. When an emulator is configured, authentication is skipped.
+honored; set `config :gcp_gcs, :emulator_env, false` to ignore it (e.g. in
+production releases). When an emulator is configured, authentication is
+skipped, and an emulator on a non-loopback host is logged as an error at boot.
+The endpoint is resolved once at application start.
 
 ## Authentication
 
-`GcpGcs.Auth` obtains OAuth2 access tokens, caching them in ETS:
+`GcpGcs.Auth` obtains OAuth2 access tokens:
 
-1. **Goth** — when `config :gcp_gcs, :goth, MyApp.Goth` is set
-2. **gcloud CLI** — `gcloud auth application-default print-access-token`
+1. **Goth** — a per-call `goth:` option, or `config :gcp_gcs, :goth, MyApp.Goth`
+   (Goth caches and refreshes its own tokens)
+2. **gcloud CLI** — `gcloud auth application-default print-access-token`, for
+   development. Tokens are cached until shortly before their real expiry and
+   fetched once under concurrent demand. Disable with
+   `config :gcp_gcs, :gcloud_fallback, false`; pin the binary with
+   `config :gcp_gcs, :gcloud_path, "/path/to/gcloud"`.
+
+A `401` response clears the cached token and retries the request once.
 
 Using Goth:
 

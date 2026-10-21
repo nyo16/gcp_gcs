@@ -6,7 +6,9 @@ defmodule GcpGcs.Application do
 
     * `GcpGcs.Auth`'s cache — an internal GenServer that owns the ETS table
       backing the access-token cache
-    * `Finch` — the HTTP connection pool used for all requests
+    * `Finch` — the HTTP connection pool used for all requests, unless
+      `config :gcp_gcs, :start_finch, false` (then name your own instance with
+      `config :gcp_gcs, :finch_name`)
 
   The Finch pool is sized from `config :gcp_gcs, :finch` and targets either the
   production endpoint (`storage.googleapis.com`) or a configured emulator. See
@@ -14,28 +16,19 @@ defmodule GcpGcs.Application do
   """
   use Application
 
-  require Logger
+  alias GcpGcs.Config
 
   @impl true
   def start(_type, _args) do
-    _ = GcpGcs.Config.refresh()
-    warn_if_emulator_mode()
+    _ = Config.refresh()
+    Config.log_emulator_mode()
 
-    children = [
-      GcpGcs.Auth.Cache,
-      {Finch, GcpGcs.Config.finch_opts()}
-    ]
+    children =
+      if Config.start_finch?(),
+        do: [GcpGcs.Auth.Cache, {Finch, Config.finch_opts()}],
+        else: [GcpGcs.Auth.Cache]
 
     opts = [strategy: :one_for_one, name: GcpGcs.Supervisor, max_restarts: 10]
     Supervisor.start_link(children, opts)
-  end
-
-  defp warn_if_emulator_mode do
-    if GcpGcs.Config.emulator?() do
-      Logger.warning(
-        "GcpGcs: emulator mode is active — authentication will be skipped. " <>
-          "Remove the `:gcp_gcs, :emulator` config (and STORAGE_EMULATOR_HOST) for production."
-      )
-    end
   end
 end

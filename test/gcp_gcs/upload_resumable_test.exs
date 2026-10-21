@@ -114,6 +114,109 @@ defmodule GcpGcs.UploadResumableTest do
     end
   end
 
+  describe "resume after a transient failure" do
+    # PUT 0: chunk 1 persisted; PUT 1: chunk 2 fails with 503; PUT 2: the
+    # status query (reports bytes=0-262143); then the upload continues.
+    defp failing_second_put(bypass) do
+      FakeResumable.start(bypass, fn
+        1, _req -> {:status, 503}
+        _i, _req -> :all
+      end)
+    end
+
+    test "upload_stream/4 queries the status and resends the held chunk", %{bypass: bypass} do
+      server = failing_second_put(bypass)
+      data = input(3 * @chunk + 7)
+
+      assert {:ok, _} =
+               Upload.upload_stream(@bucket, "object.bin", split(data, 4096), chunk_size: @chunk)
+
+      [_first, failed, status, resent | _] = FakeResumable.puts(server)
+      assert failed.content_range == "bytes #{@chunk}-#{2 * @chunk - 1}/*"
+      assert status.content_range == "bytes */*"
+      assert status.body == ""
+      assert resent.content_range == failed.content_range
+      assert FakeResumable.data(server) == data
+    end
+
+    @tag :tmp_dir
+    test "upload_file/4 sends chunks and resumes from the persisted offset", %{
+      bypass: bypass,
+      tmp_dir: tmp_dir
+    } do
+      server = failing_second_put(bypass)
+      data = input(3 * @chunk + 7)
+      path = Path.join(tmp_dir, "payload.bin")
+      File.write!(path, data)
+
+      assert {:ok, _} = Upload.upload_file(@bucket, "object.bin", path, chunk_size: @chunk)
+
+      [first, failed, status, resent | _] = puts = FakeResumable.puts(server)
+      assert first.content_range == "bytes 0-#{@chunk - 1}/#{byte_size(data)}"
+      assert {"content-length", Integer.to_string(@chunk)} in first.headers
+      assert status.content_range == "bytes */#{byte_size(data)}"
+      assert resent.content_range == failed.content_range
+
+      assert List.last(puts).content_range ==
+               "bytes #{3 * @chunk}-#{3 * @chunk + 6}/#{byte_size(data)}"
+
+      assert FakeResumable.data(server) == data
+    end
+
+    test "with retries disabled the error carries the session URI", %{bypass: bypass} do
+      failing_second_put(bypass)
+
+      assert {:error, %Error{code: :unavailable, details: %{session_uri: uri, cause: _}}} =
+               Upload.upload_stream(@bucket, "object.bin", [input(3 * @chunk)],
+                 chunk_size: @chunk,
+                 retry: false
+               )
+
+      assert uri == FakeResumable.session_uri(bypass)
+    end
+  end
+
+  describe "integrity hash" do
+    test "the final request carries the MD5 of the whole object", %{bypass: bypass} do
+      server = FakeResumable.start(bypass)
+      data = input(2 * @chunk + 5)
+
+      assert {:ok, _} =
+               Upload.upload_stream(@bucket, "object.bin", split(data, 1000), chunk_size: @chunk)
+
+      [first, second, final] = FakeResumable.puts(server)
+      md5 = "md5=" <> Base.encode64(:crypto.hash(:md5, data))
+      assert List.keyfind(first.headers, "x-goog-hash", 0) == nil
+      assert List.keyfind(second.headers, "x-goog-hash", 0) == nil
+      assert {"x-goog-hash", md5} in final.headers
+    end
+
+    test "resent bytes are hashed once", %{bypass: bypass} do
+      server =
+        FakeResumable.start(bypass, fn
+          0, _req -> {:partial, 100}
+          _i, _req -> :all
+        end)
+
+      data = input(@chunk + 300)
+
+      assert {:ok, _} = Upload.upload_stream(@bucket, "object.bin", [data], chunk_size: @chunk)
+
+      final = server |> FakeResumable.puts() |> List.last()
+      assert {"x-goog-hash", "md5=" <> Base.encode64(:crypto.hash(:md5, data))} in final.headers
+    end
+
+    test "checksum: false sends no hash", %{bypass: bypass} do
+      server = FakeResumable.start(bypass)
+
+      assert {:ok, _} =
+               Upload.upload_stream(@bucket, "object.bin", ["abc"], checksum: false)
+
+      assert [put] = FakeResumable.puts(server)
+      assert List.keyfind(put.headers, "x-goog-hash", 0) == nil
+    end
+  end
+
   describe "upload_chunk/3 session URI validation" do
     # `other` has no expectations: any request reaching it fails the test.
     setup %{bypass: bypass} do

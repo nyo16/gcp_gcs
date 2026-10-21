@@ -18,6 +18,9 @@ defmodule GcpGcs.Download do
 
   ## Options
   - `:generation` — a specific object generation
+  - `:range` — only these bytes: `first..last` or `{first, last}` (inclusive,
+    0-based; `{first, nil}` reads to the end). Sent as `Range: bytes=first-last`;
+    a `206 Partial Content` response is a success.
   - `:timeout` — request timeout in ms
   """
   @spec download(String.t(), String.t(), keyword()) :: {:ok, binary()} | {:error, Error.t()}
@@ -75,12 +78,12 @@ defmodule GcpGcs.Download do
     end
   end
 
-  # Accumulator is `{device, :ok | {:io_error, reason}}`; after the first
-  # failed write the remaining chunks are skipped.
+  # Accumulator is `{device, :ok | {:io_error, reason}}`; the first failed
+  # write stops reading the body.
   defp write_chunk({:data, chunk}, {device, :ok}) do
     case :file.write(device, chunk) do
       :ok -> {device, :ok}
-      {:error, reason} -> {device, {:io_error, reason}}
+      {:error, reason} -> {:halt, {device, {:io_error, reason}}}
     end
   end
 
@@ -111,7 +114,10 @@ defmodule GcpGcs.Download do
   Streams an object's contents through `reducer`, folding from `acc`.
 
   `reducer` receives `{:headers, headers}` once, then `{:data, binary}` for each
-  body chunk, returning the updated accumulator. Returns `{:ok, acc}`.
+  body chunk. It returns the updated accumulator (or `{:cont, acc}`), or
+  `{:halt, acc}` to stop reading the body early. Returns `{:ok, acc}`.
+
+  Takes the options of `download/3`, including `:range`.
 
   ## Example
 
@@ -146,13 +152,35 @@ defmodule GcpGcs.Download do
   defp stream_media(bucket, object, opts, acc, reducer) do
     query = [alt: "media", generation: opts[:generation]]
 
-    Client.stream(
-      :get,
-      Client.object_path(bucket, object),
-      [query: query] ++ Client.transport_opts(opts),
-      acc,
-      reducer
-    )
+    with {:ok, headers} <- range_headers(Keyword.get(opts, :range)) do
+      Client.stream(
+        :get,
+        Client.object_path(bucket, object),
+        [query: query, headers: headers] ++ Client.transport_opts(opts),
+        acc,
+        reducer
+      )
+    end
+  end
+
+  defp range_headers(nil), do: {:ok, []}
+
+  defp range_headers(first..last//1) when first >= 0 and last >= first,
+    do: {:ok, [{"range", "bytes=#{first}-#{last}"}]}
+
+  defp range_headers({first, nil}) when is_integer(first) and first >= 0,
+    do: {:ok, [{"range", "bytes=#{first}-"}]}
+
+  defp range_headers({first, last})
+       when is_integer(first) and is_integer(last) and first >= 0 and last >= first,
+       do: {:ok, [{"range", "bytes=#{first}-#{last}"}]}
+
+  defp range_headers(_range) do
+    {:error,
+     Error.new(
+       :validation_error,
+       ":range must be first..last or {first, last} with 0 <= first <= last"
+     )}
   end
 
   defp open_file(path) do

@@ -67,6 +67,43 @@ defmodule GcpGcs.IntegrationTest do
     assert Enum.sort(names) == ~w(a b c)
   end
 
+  test "stream_objects!/2 pages lazily", %{bucket: bucket} do
+    for name <- ~w(a b c), do: {:ok, _} = GcpGcs.put_object(bucket, name, name)
+
+    id = {__MODULE__, make_ref()}
+    test_pid = self()
+
+    :telemetry.attach(
+      id,
+      [:gcp_gcs, :request, :stop],
+      fn _event, _measurements, %{operation: op}, _ -> send(test_pid, {:request, op}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+    stream = GcpGcs.stream_objects!(bucket, page_size: 1)
+
+    assert stream |> Enum.map(& &1["name"]) |> Enum.sort() == ~w(a b c)
+    assert count_requests(:list_objects) >= 3
+
+    assert [_] = Enum.take(stream, 1)
+    assert count_requests(:list_objects) == 1
+  end
+
+  test "stream_objects!/2 raises on a missing bucket" do
+    assert_raise GcpGcs.Error, fn ->
+      "gcp-gcs-missing-bucket" |> GcpGcs.stream_objects!() |> Enum.to_list()
+    end
+  end
+
+  defp count_requests(op, n \\ 0) do
+    receive do
+      {:request, ^op} -> count_requests(op, n + 1)
+    after
+      0 -> n
+    end
+  end
+
   test "bucket metadata round-trips", %{bucket: bucket} do
     assert {:ok, %{"name" => ^bucket}} = GcpGcs.get_bucket(bucket)
 

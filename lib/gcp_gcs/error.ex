@@ -4,7 +4,9 @@ defmodule GcpGcs.Error do
 
   Every error returned by the library is wrapped in this struct, giving
   consistent handling across authentication, validation, transport, and
-  Google Cloud Storage API errors.
+  Google Cloud Storage API errors. It is also an exception: the only raising
+  functions, `GcpGcs.stream_objects!/2` and `GcpGcs.stream_buckets!/2`,
+  raise it.
 
   ## Fields
 
@@ -31,7 +33,7 @@ defmodule GcpGcs.Error do
         }
 
   @derive {Inspect, only: [:code, :message, :status]}
-  defstruct [:code, :message, :details, :status]
+  defexception [:code, :message, :details, :status]
 
   # HTTP status -> canonical code (aligned with Google's google.rpc.Code names).
   @status_codes %{

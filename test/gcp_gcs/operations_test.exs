@@ -108,6 +108,59 @@ defmodule GcpGcs.OperationsTest do
       assert {:ok, iodata} = GcpGcs.download_stream(@bucket, "obj", [], [], reducer)
       assert IO.iodata_to_binary(iodata) == "one,two,three"
     end
+
+    test ":range sends a Range header and a 206 is a success", %{bypass: bypass} do
+      test_pid = self()
+
+      Bypass.expect(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+        send(test_pid, {:range, Plug.Conn.get_req_header(conn, "range")})
+        Plug.Conn.resp(conn, 206, "cde")
+      end)
+
+      assert {:ok, "cde"} = GcpGcs.download(@bucket, "obj", range: 2..4)
+      assert_received {:range, ["bytes=2-4"]}
+
+      assert {:ok, "cde"} = GcpGcs.download(@bucket, "obj", range: {2, nil})
+      assert_received {:range, ["bytes=2-"]}
+
+      assert {:error, %Error{code: :validation_error}} =
+               GcpGcs.download(@bucket, "obj", range: {5, 1})
+
+      refute_received {:range, _}
+    end
+
+    test "a reducer returning {:halt, acc} stops reading the body", %{bypass: bypass} do
+      Bypass.expect_once(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+        Bypass.pass(bypass)
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        Enum.reduce(["first", "second", "third"], conn, fn part, conn ->
+          case Plug.Conn.chunk(conn, part) do
+            {:ok, conn} -> conn
+            {:error, :closed} -> conn
+          end
+        end)
+      end)
+
+      reducer = fn
+        {:data, chunk}, acc -> {:halt, [chunk | acc]}
+        _other, acc -> acc
+      end
+
+      assert {:ok, ["first"]} = GcpGcs.download_stream(@bucket, "obj", [], [], reducer)
+    end
+
+    test "a large error body is truncated to 64 KiB", %{bypass: bypass} do
+      Bypass.expect_once(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+        Bypass.pass(bypass)
+        Plug.Conn.resp(conn, 403, String.duplicate("x", 1024 * 1024))
+      end)
+
+      assert {:error, %Error{code: :permission_denied, details: body}} =
+               GcpGcs.download(@bucket, "obj")
+
+      assert byte_size(body) == 64 * 1024
+    end
   end
 
   describe "resumable upload failures" do
@@ -129,7 +182,7 @@ defmodule GcpGcs.OperationsTest do
                GcpGcs.upload_stream(@bucket, "obj", ["data"])
     end
 
-    test "a failing chunk PUT stops the upload", %{bypass: bypass} do
+    test "with retries disabled, a failing chunk PUT stops the upload", %{bypass: bypass} do
       server =
         FakeResumable.start(bypass, fn
           1, _req -> {:status, 503}
@@ -139,9 +192,11 @@ defmodule GcpGcs.OperationsTest do
       chunk = 262_144
       data = :crypto.strong_rand_bytes(4 * chunk)
 
-      assert {:error, %Error{code: :unavailable, status: 503}} =
-               GcpGcs.upload_stream(@bucket, "obj", [data], chunk_size: chunk)
+      assert {:error, %Error{code: :unavailable, status: 503, details: details}} =
+               GcpGcs.upload_stream(@bucket, "obj", [data], chunk_size: chunk, retry: false)
 
+      assert %{session_uri: session_uri} = details
+      assert session_uri == FakeResumable.session_uri(bypass)
       assert length(FakeResumable.puts(server)) == 2
     end
 

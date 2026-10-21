@@ -102,5 +102,54 @@ defmodule GcpGcs.ConfigTest do
 
       assert transport_opts[:verify] == :verify_peer
     end
+
+    test "pool size, count and protocols follow config, with per-scheduler shards by default" do
+      put_emulator(false)
+      delete_env_for_test(:gcp_gcs, :finch)
+      pool = Config.finch_opts()[:pools]["https://storage.googleapis.com:443"]
+      assert pool[:size] == 10
+      assert pool[:count] == System.schedulers_online()
+      refute Keyword.has_key?(pool, :protocols)
+
+      put_env_for_test(:gcp_gcs, :finch, pool_size: 3, pool_count: 2, protocols: [:http2])
+      pool = Config.finch_opts()[:pools]["https://storage.googleapis.com:443"]
+      assert {pool[:size], pool[:count], pool[:protocols]} == {3, 2, [:http2]}
+    end
+
+    test "the Finch instance name is configurable" do
+      put_env_for_test(:gcp_gcs, :finch_name, MyApp.Finch)
+      assert Config.finch_opts()[:name] == MyApp.Finch
+      assert Config.finch_name() == MyApp.Finch
+    end
+  end
+
+  describe "emulator guard" do
+    import ExUnit.CaptureLog
+
+    test "a non-loopback STORAGE_EMULATOR_HOST is logged as an error" do
+      put_system_env_for_test("STORAGE_EMULATOR_HOST", "http://10.1.2.3:4443")
+
+      log = capture_log([level: :warning], fn -> Config.log_emulator_mode() end)
+      assert log =~ "[error]"
+      assert log =~ "non-loopback host 10.1.2.3:4443"
+    end
+
+    test "loopback emulators only warn" do
+      for host <- ["http://localhost:4443", "http://127.0.0.5:4443", "http://[::1]:4443"] do
+        put_system_env_for_test("STORAGE_EMULATOR_HOST", host)
+
+        log = capture_log([level: :warning], fn -> Config.log_emulator_mode() end)
+        assert log =~ "[warning]"
+        refute log =~ "[error]"
+      end
+    end
+
+    test "emulator_env: false ignores STORAGE_EMULATOR_HOST" do
+      put_env_for_test(:gcp_gcs, :emulator_env, false)
+      put_system_env_for_test("STORAGE_EMULATOR_HOST", "http://10.1.2.3:4443")
+
+      refute Config.emulator?()
+      assert Config.base_url() == "https://storage.googleapis.com"
+    end
   end
 end

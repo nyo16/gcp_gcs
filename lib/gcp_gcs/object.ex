@@ -43,6 +43,9 @@ defmodule GcpGcs.Object do
   - `:page_token` — pagination token
   - `:start_offset` / `:end_offset` — lexicographic range filters
   - `:versions` — `true` to include non-current object versions
+  - `:fields` — partial-response field selector, e.g.
+    `"items(name,size),prefixes,nextPageToken"` (keep `nextPageToken` to
+    paginate)
 
   Returns `{:ok, %{items: [...], prefixes: [...], next_page_token: token}}`.
   """
@@ -59,13 +62,33 @@ defmodule GcpGcs.Object do
           pageToken: opts[:page_token],
           startOffset: opts[:start_offset],
           endOffset: opts[:end_offset],
-          versions: opts[:versions]
+          versions: opts[:versions],
+          fields: opts[:fields]
         ]
 
         :get
         |> Client.request("/b/#{bucket}/o", [query: query] ++ Client.transport_opts(opts))
         |> Result.list("items")
       end
+    end)
+  end
+
+  @doc """
+  Lazily lists every object in a bucket, following page tokens.
+
+  Takes the options of `list/2`; `:page_size` sets how many objects each
+  request fetches. Pages are requested only as the stream is consumed, so
+  `Enum.take(stream, 10)` stops after the pages it needs. Only `items` are
+  emitted (not `prefixes`).
+
+  **Raises** `GcpGcs.Error` when a page request fails, since a stream cannot
+  return an error tuple. This (with `GcpGcs.Bucket.stream!/2`) is the only
+  raising API.
+  """
+  @spec stream!(String.t(), keyword()) :: Enumerable.t()
+  def stream!(bucket, opts \\ []) do
+    Result.stream_pages(opts[:page_token], fn token ->
+      list(bucket, Keyword.put(opts, :page_token, token))
     end)
   end
 

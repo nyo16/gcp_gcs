@@ -1,6 +1,6 @@
 defmodule GcpGcs.Config do
   @moduledoc """
-  Resolves endpoint, emulator, and Finch settings for `GcpGcs`.
+  Resolves endpoint, emulator, transport and auth settings for `GcpGcs`.
 
   ## Production (default)
 
@@ -19,15 +19,29 @@ defmodule GcpGcs.Config do
 
   Alternatively, set the `STORAGE_EMULATOR_HOST` environment variable
   (honored by the official Google client libraries), e.g.
-  `STORAGE_EMULATOR_HOST=http://localhost:4443`.
+  `STORAGE_EMULATOR_HOST=http://localhost:4443`. To ignore that variable (for
+  example in production releases), set:
 
-  When an emulator is configured, authentication is skipped.
+      config :gcp_gcs, :emulator_env, false
+
+  When an emulator is configured, authentication is skipped; an emulator on a
+  non-loopback host is logged as an error at boot. The endpoint is resolved
+  once, when the application starts.
 
   ## Finch pool
 
       config :gcp_gcs, :finch,
-        pool_size: 50,
-        pool_count: 1
+        pool_size: 10,                        # connections per shard
+        pool_count: System.schedulers_online(), # shards
+        protocols: [:http1]                   # opt in to [:http2] explicitly
+
+      # Use your own Finch instance instead of the one GcpGcs starts:
+      config :gcp_gcs, :start_finch, false
+      config :gcp_gcs, :finch_name, MyApp.Finch
+
+  Concurrent transfers each hold a connection for their whole duration, so
+  size the pool (`pool_size * pool_count`) for the number of simultaneous
+  uploads/downloads plus metadata calls.
 
   ## Timeouts
 
@@ -38,20 +52,52 @@ defmodule GcpGcs.Config do
       # return {:error, %GcpGcs.Error{code: :resource_exhausted}}.
       config :gcp_gcs, :pool_timeout, 5_000
 
-  Both can be overridden per call with the `:timeout` and `:pool_timeout`
-  options.
+  Per call: `:timeout`, `:pool_timeout`, and `:request_timeout` (an overall
+  deadline for metadata requests, defaulting to `:timeout`; not applied to
+  streamed downloads).
+
+  ## Retries
+
+      config :gcp_gcs, :retry, max_attempts: 4, base_delay: 200, max_delay: 10_000
+
+  Idempotent requests are retried on 408, 429, 5xx (500, 502, 503, 504) and
+  connection errors (closed, timeout, refused) with exponential backoff and
+  full jitter, honouring `Retry-After`. Pass `retry: false` (or a keyword list
+  overriding the settings above) per call.
+
+  ## gcloud CLI fallback
+
+      config :gcp_gcs, :gcloud_path, "/usr/local/bin/gcloud"  # default: "gcloud" on PATH
+      config :gcp_gcs, :gcloud_fallback, false                # disable it entirely
+
+  The gcloud fallback is meant for development; production deployments should
+  use Goth (`config :gcp_gcs, :goth, MyApp.Goth`).
+
+  ## Per-call overrides
+
+  Every operation accepts `:goth` (a Goth instance name), `:finch` (a Finch
+  instance name) and `:base_url` (e.g. a regional or private endpoint). A
+  per-call `:base_url` never implies emulator mode: authentication stays on.
   """
+
+  require Logger
 
   @prod_host "storage.googleapis.com"
   @default_timeout 30_000
   @default_pool_timeout 5_000
-  @finch_name GcpGcs.Finch
+  @default_finch_name GcpGcs.Finch
+  @default_pool_size 10
+  @default_retry [max_attempts: 4, base_delay: 200, max_delay: 10_000]
 
   @type emulator :: %{scheme: String.t(), host: String.t(), port: pos_integer()}
 
-  @doc "The registered name of the Finch pool started by `GcpGcs.Application`."
+  @doc "The name of the Finch instance used for requests (`config :gcp_gcs, :finch_name`)."
   @spec finch_name() :: atom()
-  def finch_name, do: @finch_name
+  def finch_name, do: Application.get_env(:gcp_gcs, :finch_name, @default_finch_name)
+
+  @doc "Whether `GcpGcs.Application` starts its own Finch instance (`config :gcp_gcs, :start_finch`)."
+  @spec start_finch?() :: boolean()
+  def start_finch?, do: Application.get_env(:gcp_gcs, :start_finch, true)
 
   @doc "Default request timeout in milliseconds."
   @spec default_timeout() :: pos_integer()
@@ -64,6 +110,20 @@ defmodule GcpGcs.Config do
   def pool_timeout do
     Application.get_env(:gcp_gcs, :pool_timeout, @default_pool_timeout)
   end
+
+  @doc "Retry settings: `max_attempts`, `base_delay` and `max_delay` (ms)."
+  @spec retry() :: keyword()
+  def retry do
+    Keyword.merge(@default_retry, Application.get_env(:gcp_gcs, :retry, []))
+  end
+
+  @doc "The gcloud executable used by the CLI auth fallback."
+  @spec gcloud_path() :: String.t()
+  def gcloud_path, do: Application.get_env(:gcp_gcs, :gcloud_path, "gcloud")
+
+  @doc "Whether the gcloud CLI auth fallback is enabled."
+  @spec gcloud_fallback?() :: boolean()
+  def gcloud_fallback?, do: Application.get_env(:gcp_gcs, :gcloud_fallback, true)
 
   # The endpoint is resolved from app env / STORAGE_EMULATOR_HOST once, at
   # application start, and served from :persistent_term on every request.
@@ -150,27 +210,76 @@ defmodule GcpGcs.Config do
   end
 
   @doc false
+  # Logs the emulator mode at boot: a warning on loopback hosts, an error on
+  # any other host, where unauthenticated plaintext requests could reach a
+  # machine the operator didn't intend.
+  @spec log_emulator_mode() :: :ok
+  def log_emulator_mode do
+    {_scheme, host, port} = endpoint()
+
+    cond do
+      not emulator?() ->
+        :ok
+
+      loopback?(host) ->
+        Logger.warning(
+          "GcpGcs: emulator mode is active — authentication will be skipped. " <>
+            "Remove the `:gcp_gcs, :emulator` config (and STORAGE_EMULATOR_HOST) for production."
+        )
+
+      true ->
+        Logger.error(
+          "GcpGcs: emulator mode targets non-loopback host #{host}:#{port} — requests are " <>
+            "sent unauthenticated to it. Set `config :gcp_gcs, :emulator_env, false` to " <>
+            "ignore STORAGE_EMULATOR_HOST."
+        )
+    end
+  end
+
+  @doc false
+  @spec loopback?(String.t()) :: boolean()
+  def loopback?("localhost"), do: true
+
+  def loopback?(host) do
+    address = host |> String.trim_leading("[") |> String.trim_trailing("]") |> to_charlist()
+
+    case :inet.parse_address(address) do
+      {:ok, {127, _, _, _}} -> true
+      {:ok, {0, 0, 0, 0, 0, 0, 0, 1}} -> true
+      _ -> false
+    end
+  end
+
+  @doc false
   @spec finch_opts() :: keyword()
   def finch_opts do
     finch = Application.get_env(:gcp_gcs, :finch, [])
     {scheme, host, port} = endpoint()
 
-    pool = [
-      size: Keyword.get(finch, :pool_size, 25),
-      count: Keyword.get(finch, :pool_count, 1)
-    ]
+    pool =
+      [
+        size: Keyword.get(finch, :pool_size, @default_pool_size),
+        count: Keyword.get(finch, :pool_count, System.schedulers_online())
+      ] ++ protocols(finch)
 
     # The :default entry covers origins other than the endpoint (e.g. a
     # per-call base URL): it gets the same strict TLS settings, so an
     # unmatched https origin never falls back to Finch's defaults. Finch drops
     # TLS options for plain-http origins.
     [
-      name: @finch_name,
+      name: finch_name(),
       pools: %{
         :default => pool ++ conn_opts(:https),
         "#{scheme}://#{host}:#{port}" => pool ++ conn_opts(scheme)
       }
     ]
+  end
+
+  defp protocols(finch) do
+    case Keyword.fetch(finch, :protocols) do
+      {:ok, protocols} -> [protocols: protocols]
+      :error -> []
+    end
   end
 
   # Strict TLS for HTTPS: verify the server certificate against the OS trust
@@ -196,10 +305,11 @@ defmodule GcpGcs.Config do
   # Private
 
   defp emulator_from_env do
-    case System.get_env("STORAGE_EMULATOR_HOST") do
-      nil -> nil
-      "" -> nil
-      url -> parse_emulator_url(url)
+    with true <- Application.get_env(:gcp_gcs, :emulator_env, true),
+         url when url not in [nil, ""] <- System.get_env("STORAGE_EMULATOR_HOST") do
+      parse_emulator_url(url)
+    else
+      _ -> nil
     end
   end
 

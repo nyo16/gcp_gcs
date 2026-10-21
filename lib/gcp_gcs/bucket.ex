@@ -69,6 +69,8 @@ defmodule GcpGcs.Bucket do
   - `:prefix` — filter results to names starting with this prefix
   - `:page_size` — maximum results per page (maps to `maxResults`)
   - `:page_token` — pagination token
+  - `:fields` — partial-response field selector, e.g.
+    `"items(name,location),nextPageToken"` (keep `nextPageToken` to paginate)
 
   Returns `{:ok, %{items: [...], next_page_token: token}}`.
   """
@@ -81,13 +83,31 @@ defmodule GcpGcs.Bucket do
           project: project_id,
           prefix: opts[:prefix],
           maxResults: opts[:page_size],
-          pageToken: opts[:page_token]
+          pageToken: opts[:page_token],
+          fields: opts[:fields]
         ]
 
         :get
         |> Client.request("/b", [query: query] ++ Client.transport_opts(opts))
         |> Result.list("items")
       end
+    end)
+  end
+
+  @doc """
+  Lazily lists every bucket in `project_id`, following page tokens.
+
+  Takes the options of `list/2`. Pages are requested only as the stream is
+  consumed.
+
+  **Raises** `GcpGcs.Error` when a page request fails, since a stream cannot
+  return an error tuple. This (with `GcpGcs.Object.stream!/2`) is the only
+  raising API.
+  """
+  @spec stream!(String.t(), keyword()) :: Enumerable.t()
+  def stream!(project_id, opts \\ []) do
+    Result.stream_pages(opts[:page_token], fn token ->
+      list(project_id, Keyword.put(opts, :page_token, token))
     end)
   end
 

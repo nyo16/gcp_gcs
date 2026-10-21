@@ -2,7 +2,7 @@ defmodule GcpGcs.Validation do
   @moduledoc false
   # Input validation for GcpGcs. Returns {:ok, value} | {:error, %GcpGcs.Error{}}.
 
-  alias GcpGcs.{Config, Error}
+  alias GcpGcs.Error
 
   # Bucket naming: 3-63 chars, lowercase letters/digits/hyphens/underscores/dots,
   # must start and end with a letter or digit. (Dotted "domain-named" buckets up
@@ -155,15 +155,15 @@ defmodule GcpGcs.Validation do
   defp valid_source?(_), do: false
 
   # A resumable session URI is a bearer capability: it must point at the
-  # configured endpoint's upload API, never at an arbitrary host, so a
-  # caller-supplied or server-returned URI can't redirect object bytes.
-  @spec validate_session_uri(term()) :: {:ok, String.t()} | {:error, Error.t()}
-  def validate_session_uri(uri) when is_binary(uri) do
-    {scheme, host, port} = Config.endpoint()
-    expected_scheme = Atom.to_string(scheme)
+  # upload API of the endpoint in use (`base_url`, e.g. the configured one),
+  # never at an arbitrary host, so a caller-supplied or server-returned URI
+  # can't redirect object bytes.
+  @spec validate_session_uri(term(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  def validate_session_uri(uri, base_url) when is_binary(uri) do
+    %URI{scheme: scheme, host: host, port: port} = URI.parse(base_url)
 
     case URI.new(uri) do
-      {:ok, %URI{scheme: ^expected_scheme, host: ^host, port: ^port, userinfo: nil, path: path}}
+      {:ok, %URI{scheme: ^scheme, host: ^host, port: ^port, userinfo: nil, path: path}}
       when is_binary(path) ->
         if String.starts_with?(path, "/upload/storage/v1/"),
           do: {:ok, uri},
@@ -174,7 +174,7 @@ defmodule GcpGcs.Validation do
     end
   end
 
-  def validate_session_uri(_), do: session_uri_error()
+  def validate_session_uri(_uri, _base_url), do: session_uri_error()
 
   defp session_uri_error do
     {:error,

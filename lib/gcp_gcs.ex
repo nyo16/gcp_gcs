@@ -71,6 +71,9 @@ defmodule GcpGcs do
   @doc "Lists buckets in a project. See `GcpGcs.Bucket.list/2`."
   defdelegate list_buckets(project_id, opts \\ []), to: Bucket, as: :list
 
+  @doc "Lazily streams every bucket in a project; raises on error. See `GcpGcs.Bucket.stream!/2`."
+  defdelegate stream_buckets!(project_id, opts \\ []), to: Bucket, as: :stream!
+
   @doc "Deletes a bucket. See `GcpGcs.Bucket.delete/2`."
   defdelegate delete_bucket(bucket, opts \\ []), to: Bucket, as: :delete
 
@@ -84,6 +87,9 @@ defmodule GcpGcs do
 
   @doc "Lists objects in a bucket. See `GcpGcs.Object.list/2`."
   defdelegate list_objects(bucket, opts \\ []), to: Object, as: :list
+
+  @doc "Lazily streams every object in a bucket; raises on error. See `GcpGcs.Object.stream!/2`."
+  defdelegate stream_objects!(bucket, opts \\ []), to: Object, as: :stream!
 
   @doc "Deletes an object. See `GcpGcs.Object.delete/3`."
   defdelegate delete_object(bucket, object, opts \\ []), to: Object, as: :delete

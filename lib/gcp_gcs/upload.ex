@@ -6,8 +6,21 @@ defmodule GcpGcs.Upload do
 
     * **Simple** (`put_object/4`) — a single request for in-memory data.
     * **Resumable** (`upload_file/4`, `upload_stream/4`) — initiates a resumable
-      session then streams the body, using constant memory. Best for large
-      objects and for data produced incrementally.
+      session then sends the body in chunks, using bounded memory. Best for
+      large objects and for data produced incrementally.
+
+  Resumable uploads recover from transient failures (5xx, 408, 429, dropped
+  connections): they ask the session how many bytes it has persisted and
+  resume from there, within the retry budget of `GcpGcs.Config` (`retry:
+  false` disables this). `upload_file/4` can re-read any part of the file;
+  `upload_stream/4` can only resend the bytes it still holds (at most one
+  chunk), and fails with `:data_loss` if the session lost more than that.
+
+  The final request of a resumable upload carries an `X-Goog-Hash` MD5 of the
+  whole object, so Cloud Storage rejects a corrupted upload (`checksum: false`
+  disables it). Once a session exists, every error's `details` is
+  `%{session_uri: uri, cause: original_details}` so callers can resume
+  manually — the session URI is a bearer capability, never log it.
 
   Low-level resumable primitives (`start_resumable_upload/3`, `upload_chunk/3`)
   are provided for callers that need manual control over chunking and retries.
@@ -45,7 +58,7 @@ defmodule GcpGcs.Upload do
   Uploads from a source, choosing a strategy automatically:
 
     * a binary → simple upload (`put_object/4`)
-    * `{:file, path}` → resumable streamed upload (`upload_file/4`)
+    * `{:file, path}` → resumable upload (`upload_file/4`)
     * an `Enumerable` of binaries → resumable streamed upload (`upload_stream/4`)
 
   Any other source returns `{:error, %GcpGcs.Error{code: :validation_error}}`
@@ -68,16 +81,18 @@ defmodule GcpGcs.Upload do
   end
 
   @doc """
-  Uploads a local file using a resumable session, streaming it in one request
-  with constant memory.
+  Uploads a local file using a resumable session, in chunks read from disk
+  (bounded memory). Transient failures resume from the persisted offset.
 
   Content type defaults to a guess from the object's extension.
 
   ## Options
   - `:content_type` — overrides the guessed content type
-  - `:chunk_size` — read size in bytes (rounded to a 256 KiB multiple)
+  - `:chunk_size` — bytes per request (rounded to a 256 KiB multiple;
+    default 8 MiB)
   - `:attrs` — Object resource metadata to set on the new object
-  - `:timeout` — request timeout in ms
+  - `:checksum` — `false` to skip the `X-Goog-Hash` MD5 (default `true`)
+  - `:timeout` — per-request timeout in ms
   """
   @spec upload_file(String.t(), String.t(), Path.t(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
@@ -99,12 +114,14 @@ defmodule GcpGcs.Upload do
   Uploads from an `Enumerable` of binaries using a resumable session.
 
   The data is rebuffered into 256 KiB-aligned chunks and sent incrementally, so
-  the total size need not be known up front and memory stays bounded.
+  the total size need not be known up front and memory stays bounded (about
+  one chunk plus the largest element).
 
   ## Options
   - `:content_type` — defaults to `"application/octet-stream"`
   - `:chunk_size` — chunk size in bytes (rounded to a 256 KiB multiple)
   - `:attrs` — Object resource metadata to set on the new object
+  - `:checksum` — `false` to skip the `X-Goog-Hash` MD5 (default `true`)
   - `:timeout` — per-request timeout in ms
   """
   @spec upload_stream(String.t(), String.t(), Enumerable.t(), keyword()) ::
@@ -113,8 +130,11 @@ defmodule GcpGcs.Upload do
     Telemetry.span(:upload, %{bucket: bucket, object: object, strategy: :resumable}, fn ->
       with {:ok, _} <- Validation.validate_location(bucket, object),
            {:ok, _} <- Validation.validate_enumerable(enum, "source"),
-           {:ok, session} <- start_resumable_upload(bucket, object, opts) do
-        stream_to_session(session, enum, chunk_size(opts), opts)
+           {:ok, session} <- start_session(bucket, object, opts) do
+        session
+        |> transfer(opts)
+        |> stream_to_session(enum, chunk_size(opts))
+        |> with_session(session)
       end
     end)
   end
@@ -180,7 +200,7 @@ defmodule GcpGcs.Upload do
   Uploads a single chunk to a resumable `session_uri`.
 
   `session_uri` must be a URI returned by `start_resumable_upload/3`: it is
-  checked against the configured endpoint (scheme, host, port and the
+  checked against the endpoint in use (scheme, host, port and the
   `/upload/storage/v1/` path) and rejected with `:validation_error` otherwise.
   The session URI is itself the credential, so no `authorization` header is
   sent with the chunk.
@@ -201,18 +221,31 @@ defmodule GcpGcs.Upload do
   @spec upload_chunk(String.t(), binary(), keyword()) ::
           {:ok, map()} | {:resume, non_neg_integer()} | {:error, Error.t()}
   def upload_chunk(session_uri, data, opts) do
-    with {:ok, _} <- Validation.validate_session_uri(session_uri),
+    with {:ok, _} <- Validation.validate_session_uri(session_uri, Client.base_url(opts)),
          {:ok, _} <- Validation.validate_binary(data, "data"),
          {:ok, offset} <- Validation.validate_non_neg_integer(opts[:offset], ":offset"),
          {:ok, total} <- Validation.validate_optional_non_neg_integer(opts[:total], ":total") do
-      do_upload_chunk(session_uri, data, offset, total, opts)
+      put_session(session_uri, data, offset, total, opts, [])
     end
   end
 
-  defp do_upload_chunk(session_uri, data, offset, total, opts) do
+  @doc false
+  # Asks a resumable session how many bytes it has persisted (`total` if
+  # known): `{:resume, persisted}`, or `{:ok, object}` if it is complete.
+  @spec query_status(String.t(), non_neg_integer() | nil, keyword()) ::
+          {:ok, map()} | {:resume, non_neg_integer()} | {:error, Error.t()}
+  def query_status(session_uri, total, opts) do
+    put_session(session_uri, "", 0, total, opts, [{"content-length", "0"}])
+  end
+
+  # A session PUT. Not retried by the transport (a blind resend of a partly
+  # persisted chunk is wrong); `transfer/2` recovers via query_status/3.
+  defp put_session(session_uri, data, offset, total, opts, extra_headers) do
     request_opts =
       [
-        headers: [{"content-range", content_range(offset, byte_size(data), total)}],
+        headers: [
+          {"content-range", content_range(offset, byte_size(data), total)} | extra_headers
+        ],
         body: {:binary, data, @default_content_type},
         # The session URI is the credential: no bearer token on session PUTs.
         auth: false,
@@ -260,36 +293,108 @@ defmodule GcpGcs.Upload do
   end
 
   defp upload_file_body(bucket, object, path, size, opts) do
-    with {:ok, session} <- start_resumable_upload(bucket, object, opts),
-         {:ok, _} <- Validation.validate_session_uri(session) do
-      body = {:stream, File.stream!(path, chunk_size(opts)), opts[:content_type]}
-
-      # Declaring Content-Length keeps Mint from sending the stream body with
-      # transfer-encoding: chunked, which GCS rejects with 411 on the session
-      # PUT. The size is known from File.stat here, so this costs nothing.
-      headers = [
-        {"content-range", content_range(0, size, size)},
-        {"content-length", Integer.to_string(size)}
-      ]
-
-      # The session URI is the credential: no bearer token on the PUT.
-      Client.request(
-        :put,
-        session,
-        [headers: headers, body: body, auth: false, expect: [200, 201]] ++
-          Client.transport_opts(opts)
-      )
+    with {:ok, session} <- start_session(bucket, object, opts) do
+      session
+      |> transfer(opts)
+      |> file_to_session(path, size, chunk_size(opts))
+      |> with_session(session)
     end
   end
 
-  # Folds an enumerable into the resumable session: full chunks are sent as
-  # intermediate PUTs (`/*`); the remainder is finalized with the known total.
-  defp stream_to_session(session, enum, chunk, opts) do
+  defp start_session(bucket, object, opts) do
+    with {:ok, session} <- start_resumable_upload(bucket, object, opts),
+         {:ok, _} <- Validation.validate_session_uri(session, Client.base_url(opts)) do
+      {:ok, session}
+    end
+  end
+
+  # Failures after the session exists carry its URI so callers can resume.
+  defp with_session({:error, %Error{details: details} = error}, session) do
+    {:error, %{error | details: %{session_uri: session, cause: details}}}
+  end
+
+  defp with_session(result, _session), do: result
+
+  # Resumable transfer engine ----------------------------------------------------
+  #
+  # State of one transfer into a session:
+  #   * `failures` — consecutive transient failures (reset on progress)
+  #   * `stalled?` — the previous 308 made no progress; one stall is
+  #     tolerated (e.g. a 308 without `Range` on the first chunk: nothing
+  #     persisted, resend it), a second consecutive one is an error
+  #   * `hash` — `{md5_ctx, hashed_upto}` over the bytes sent so far, or nil
+
+  defp transfer(session, opts) do
+    %{
+      session: session,
+      opts: opts,
+      policy: Client.retry_policy(opts),
+      failures: 0,
+      stalled?: false,
+      hash: if(Keyword.get(opts, :checksum, true), do: {:crypto.hash_init(:md5), 0})
+    }
+  end
+
+  # Sends bytes `offset..offset + byte_size(data) - 1`. Returns
+  # `{:resume, persisted, t}`, `{:ok, object}` or `{:error, error}`.
+  defp send_range(t, offset, data, total) do
+    t = advance_hash(t, offset, data)
+    extra = hash_header(t, offset + byte_size(data), total)
+
+    case put_session(t.session, data, offset, total, t.opts, extra) do
+      {:resume, persisted} -> {:resume, persisted, t}
+      {:ok, object} -> {:ok, object}
+      {:error, %Error{} = error} -> recover(t, total, error)
+    end
+  end
+
+  # On a transient failure: back off, ask the session what it holds and resume
+  # from there. A recovery is not a stall.
+  defp recover(t, total, error) do
+    failures = t.failures + 1
+
+    if t.policy && Client.retryable_error?(error) && failures < t.policy[:max_attempts] do
+      Client.backoff(t.policy, failures)
+      t = %{t | failures: failures, stalled?: false}
+
+      case query_status(t.session, total, t.opts) do
+        {:resume, persisted} -> {:resume, persisted, t}
+        {:ok, object} -> {:ok, object}
+        {:error, %Error{} = error} -> recover(t, total, error)
+      end
+    else
+      {:error, error}
+    end
+  end
+
+  # Records a 308: progress resets the failure count; no progress twice in a
+  # row is an error rather than a resend loop.
+  defp note_progress(t, offset, persisted) do
+    cond do
+      persisted > offset ->
+        {:ok, %{t | failures: 0, stalled?: false}}
+
+      t.stalled? ->
+        {:error,
+         Error.new(
+           :internal,
+           "resumable upload made no progress at offset #{offset}",
+           %{persisted: persisted, offset: offset}
+         )}
+
+      true ->
+        {:ok, %{t | stalled?: true}}
+    end
+  end
+
+  # Streams: full chunks are sent as intermediate PUTs (`/*`); the remainder
+  # is finalized with the known total. Only the current chunk can be resent.
+  defp stream_to_session(t, enum, chunk) do
     result =
-      Enum.reduce_while(enum, {:ok, 0, ""}, fn
-        data, {:ok, offset, buf} when is_binary(data) ->
-          case flush_chunks(session, offset, buf <> data, chunk, opts) do
-            {:ok, new_offset, rest} -> {:cont, {:ok, new_offset, rest}}
+      Enum.reduce_while(enum, {:ok, t, 0, ""}, fn
+        data, {:ok, t, offset, buf} when is_binary(data) ->
+          case flush_chunks(t, offset, buf <> data, chunk) do
+            {:ok, t, offset, rest} -> {:cont, {:ok, t, offset, rest}}
             {:error, %Error{}} = error -> {:halt, error}
           end
 
@@ -298,23 +403,19 @@ defmodule GcpGcs.Upload do
       end)
 
     case result do
-      {:ok, offset, buf} -> finalize(session, offset, buf, opts)
+      {:ok, t, offset, buf} -> finalize(t, offset, buf)
       {:error, %Error{}} = error -> error
     end
   end
 
-  # `stalled?` records that the previous 308 made no progress. One stall is
-  # tolerated (e.g. a 308 without `Range` on the first chunk: nothing persisted,
-  # resend it), a second consecutive one is an error rather than a resend loop.
-  defp flush_chunks(session, offset, buf, chunk, opts, stalled? \\ false)
-
-  defp flush_chunks(session, offset, buf, chunk, opts, stalled?) when byte_size(buf) >= chunk do
+  defp flush_chunks(t, offset, buf, chunk) when byte_size(buf) >= chunk do
     <<piece::binary-size(^chunk), rest::binary>> = buf
 
-    case upload_chunk(session, piece, [offset: offset, total: nil] ++ Client.transport_opts(opts)) do
-      {:resume, next} ->
-        with {:ok, unsent, stalled?} <- unsent_tail(piece, offset, next, stalled?) do
-          flush_chunks(session, next, prepend(unsent, rest), chunk, opts, stalled?)
+    case send_range(t, offset, piece, nil) do
+      {:resume, next, t} ->
+        with {:ok, t} <- note_progress(t, offset, next),
+             {:ok, unsent} <- unsent_tail(piece, offset, next) do
+          flush_chunks(t, next, prepend(unsent, rest), chunk)
         end
 
       {:ok, _object} ->
@@ -325,18 +426,19 @@ defmodule GcpGcs.Upload do
     end
   end
 
-  defp flush_chunks(_session, offset, buf, _chunk, _opts, _stalled?), do: {:ok, offset, buf}
+  defp flush_chunks(t, offset, buf, _chunk), do: {:ok, t, offset, buf}
 
-  defp finalize(session, offset, buf, opts, stalled? \\ false) do
+  defp finalize(t, offset, buf) do
     total = offset + byte_size(buf)
 
-    case upload_chunk(session, buf, [offset: offset, total: total] ++ Client.transport_opts(opts)) do
+    case send_range(t, offset, buf, total) do
       {:ok, object} ->
         {:ok, object}
 
-      {:resume, next} ->
-        with {:ok, unsent, stalled?} <- unsent_tail(buf, offset, next, stalled?) do
-          finalize(session, next, unsent, opts, stalled?)
+      {:resume, next, t} ->
+        with {:ok, t} <- note_progress(t, offset, next),
+             {:ok, unsent} <- unsent_tail(buf, offset, next) do
+          finalize(t, next, unsent)
         end
 
       {:error, %Error{}} = error ->
@@ -349,7 +451,7 @@ defmodule GcpGcs.Upload do
   # that still have to be (re)sent. Bytes before `offset` were already
   # discarded (streams can't be rewound), so a server behind `offset` is data
   # loss; a server ahead of what was sent is a protocol violation.
-  defp unsent_tail(sent, offset, next, stalled?) do
+  defp unsent_tail(sent, offset, next) do
     sent_end = offset + byte_size(sent)
 
     cond do
@@ -363,28 +465,92 @@ defmodule GcpGcs.Upload do
          )}
 
       next > sent_end ->
-        {:error,
-         Error.new(
-           :internal,
-           "resumable session reported #{next} bytes persisted, but only #{sent_end} were sent",
-           %{persisted: next, sent: sent_end}
-         )}
-
-      next == offset and stalled? ->
-        {:error,
-         Error.new(
-           :internal,
-           "resumable upload made no progress at offset #{offset}",
-           %{persisted: next, offset: offset}
-         )}
+        {:error, ahead_of_sent(next, sent_end)}
 
       true ->
-        {:ok, binary_part(sent, next - offset, sent_end - next), next == offset}
+        {:ok, binary_part(sent, next - offset, sent_end - next)}
     end
+  end
+
+  defp ahead_of_sent(next, sent_end) do
+    Error.new(
+      :internal,
+      "resumable session reported #{next} bytes persisted, but only #{sent_end} were sent",
+      %{persisted: next, sent: sent_end}
+    )
   end
 
   defp prepend("", rest), do: rest
   defp prepend(unsent, rest), do: unsent <> rest
+
+  # Files: chunks are read with pread from wherever the session says it is,
+  # so any persisted offset can be resumed from.
+  defp file_to_session(t, path, size, chunk) do
+    case File.open(path, [:read, :binary, :raw]) do
+      {:ok, fd} ->
+        try do
+          file_chunks(t, fd, path, 0, size, chunk)
+        after
+          File.close(fd)
+        end
+
+      {:error, reason} ->
+        {:error, Error.new(:io_error, "could not open #{path}", reason)}
+    end
+  end
+
+  defp file_chunks(t, fd, path, offset, size, chunk) do
+    len = min(chunk, size - offset)
+
+    with {:ok, data} <- pread(fd, path, offset, len),
+         {:resume, next, t} <- send_range(t, offset, data, size),
+         :ok <- within_sent(next, offset + len),
+         {:ok, t} <- note_progress(t, offset, next) do
+      file_chunks(t, fd, path, next, size, chunk)
+    end
+  end
+
+  defp within_sent(next, sent_end) when next > sent_end,
+    do: {:error, ahead_of_sent(next, sent_end)}
+
+  defp within_sent(_next, _sent_end), do: :ok
+
+  defp pread(fd, path, offset, len) do
+    case :file.pread(fd, offset, len) do
+      {:ok, data} when byte_size(data) == len ->
+        {:ok, data}
+
+      {:ok, _short} ->
+        {:error, Error.new(:io_error, "#{path} shrank during upload")}
+
+      :eof ->
+        {:error, Error.new(:io_error, "#{path} shrank during upload")}
+
+      {:error, reason} ->
+        {:error, Error.new(:io_error, "could not read #{path}", reason)}
+    end
+  end
+
+  # Integrity hash -------------------------------------------------------------
+
+  # Hashes the part of `data` past what has been hashed already (resent bytes
+  # are hashed once).
+  defp advance_hash(%{hash: {ctx, upto}} = t, offset, data)
+       when offset <= upto and offset + byte_size(data) > upto do
+    new = binary_part(data, upto - offset, offset + byte_size(data) - upto)
+    %{t | hash: {:crypto.hash_update(ctx, new), offset + byte_size(data)}}
+  end
+
+  defp advance_hash(t, _offset, _data), do: t
+
+  # The final request (it reaches the known total) carries the whole-object MD5.
+  defp hash_header(%{hash: {ctx, total}}, total, total) do
+    [{"x-goog-hash", "md5=" <> Base.encode64(:crypto.hash_final(ctx))}]
+  end
+
+  defp hash_header(_t, _end, _total), do: []
+
+  # Helpers --------------------------------------------------------------------
 
   # Forward the browser Origin so GCS CORS-tags the session; without it the
   # subsequent browser PUT succeeds (200) but its response carries no
@@ -405,7 +571,9 @@ defmodule GcpGcs.Upload do
   end
 
   @doc false
+  # `bytes */*` / `bytes */total` (no bytes: a status query or empty finalize).
   @spec content_range(non_neg_integer(), non_neg_integer(), non_neg_integer() | nil) :: String.t()
+  def content_range(_offset, 0, nil), do: "bytes */*"
   def content_range(_offset, 0, total) when is_integer(total), do: "bytes */#{total}"
   def content_range(offset, len, nil), do: "bytes #{offset}-#{offset + len - 1}/*"
 

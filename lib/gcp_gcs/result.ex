@@ -34,4 +34,29 @@ defmodule GcpGcs.Result do
   end
 
   def list({:error, %Error{}} = error, _items_key), do: error
+
+  @doc """
+  A lazy stream of list items, fetching a page with `fetch.(page_token)` only
+  when needed, starting from `first_token` (`nil` for the first page). Raises
+  the `GcpGcs.Error` of a failed page.
+  """
+  @spec stream_pages(String.t() | nil, (String.t() | nil -> {:ok, map()} | {:error, Error.t()})) ::
+          Enumerable.t()
+  def stream_pages(first_token, fetch) do
+    Stream.resource(
+      fn -> {:next, first_token} end,
+      fn
+        :done ->
+          {:halt, :done}
+
+        {:next, token} ->
+          case fetch.(token) do
+            {:ok, %{items: items, next_page_token: nil}} -> {items, :done}
+            {:ok, %{items: items, next_page_token: next}} -> {items, {:next, next}}
+            {:error, %Error{} = error} -> raise error
+          end
+      end,
+      fn _ -> :ok end
+    )
+  end
 end

@@ -50,7 +50,7 @@ defmodule GcpGcs.ClientTransportTest do
       end)
 
       assert {:error, %GcpGcs.Error{code: :connection_error, details: details}} =
-               Client.request(:get, url, timeout: 50)
+               Client.request(:get, url, timeout: 50, retry: false)
 
       assert %Finch.TransportError{reason: :timeout} = details
 
@@ -102,7 +102,7 @@ defmodule GcpGcs.ClientTransportTest do
       end)
 
       assert {:error, %GcpGcs.Error{code: :unavailable, status: 503, message: "HTTP 503"}} =
-               Client.request(:get, url)
+               Client.request(:get, url, retry: false)
     end
 
     test "a 429 is :resource_exhausted", %{bypass: bypass, url: url} do
@@ -111,7 +111,7 @@ defmodule GcpGcs.ClientTransportTest do
       end)
 
       assert {:error, %GcpGcs.Error{code: :resource_exhausted, message: "rate limited"}} =
-               Client.request(:get, url)
+               Client.request(:get, url, retry: false)
     end
   end
 
@@ -123,6 +123,90 @@ defmodule GcpGcs.ClientTransportTest do
 
       assert {:error, %GcpGcs.Error{code: :connection_error}} =
                Client.stream(:get, url, [], nil, fn _, acc -> acc end)
+    end
+  end
+
+  describe "retries" do
+    # Counts calls and answers with `responses` in order (the last one repeats).
+    defp scripted(bypass, method, responses) do
+      counter = :counters.new(1, [])
+
+      Bypass.expect(bypass, method, "/storage/v1/b/bucket", fn conn ->
+        :counters.add(counter, 1, 1)
+        n = :counters.get(counter, 1)
+        {status, headers, body} = Enum.at(responses, n - 1, List.last(responses))
+
+        headers
+        |> Enum.reduce(conn, fn {k, v}, conn -> Plug.Conn.put_resp_header(conn, k, v) end)
+        |> Plug.Conn.resp(status, body)
+      end)
+
+      counter
+    end
+
+    test "a GET is retried after a 503", %{bypass: bypass, url: url} do
+      calls = scripted(bypass, "GET", [{503, [], ""}, {200, [], ~s({"name":"bucket"})}])
+
+      assert {:ok, %{"name" => "bucket"}} = Client.request(:get, url, retry: [base_delay: 0])
+      assert :counters.get(calls, 1) == 2
+    end
+
+    test "a 429 with Retry-After: 0 is retried", %{bypass: bypass, url: url} do
+      calls = scripted(bypass, "GET", [{429, [{"retry-after", "0"}], ""}, {200, [], "{}"}])
+
+      assert {:ok, %{}} = Client.request(:get, url)
+      assert :counters.get(calls, 1) == 2
+    end
+
+    test "a non-idempotent POST is not retried", %{bypass: bypass, url: url} do
+      calls = scripted(bypass, "POST", [{503, [], ""}, {200, [], "{}"}])
+
+      assert {:error, %GcpGcs.Error{code: :unavailable}} =
+               Client.request(:post, url, retry: [base_delay: 0])
+
+      assert :counters.get(calls, 1) == 1
+    end
+
+    test "a POST marked idempotent is retried", %{bypass: bypass, url: url} do
+      calls = scripted(bypass, "POST", [{503, [], ""}, {200, [], "{}"}])
+
+      assert {:ok, %{}} = Client.request(:post, url, idempotent: true, retry: [base_delay: 0])
+      assert :counters.get(calls, 1) == 2
+    end
+
+    test "exhausting max_attempts returns the last error", %{bypass: bypass, url: url} do
+      calls =
+        scripted(bypass, "GET", [
+          {503, [], ""},
+          {500, [], ""},
+          {502, [], ~s({"error":{"message":"last"}})}
+        ])
+
+      assert {:error, %GcpGcs.Error{status: 502, message: "last"}} =
+               Client.request(:get, url, retry: [max_attempts: 3, base_delay: 0])
+
+      assert :counters.get(calls, 1) == 3
+    end
+
+    test "retry: false disables retries", %{bypass: bypass, url: url} do
+      calls = scripted(bypass, "GET", [{503, [], ""}, {200, [], "{}"}])
+
+      assert {:error, %GcpGcs.Error{code: :unavailable}} = Client.request(:get, url, retry: false)
+      assert :counters.get(calls, 1) == 1
+    end
+
+    test "a streamed GET is retried before the reducer sees anything", %{bypass: bypass, url: url} do
+      calls = scripted(bypass, "GET", [{503, [], "busy"}, {200, [], "payload"}])
+
+      reducer = fn
+        {:data, data}, acc -> acc <> data
+        _other, acc -> acc
+      end
+
+      assert {:ok, {200, _headers, "payload"}} =
+               Client.stream(:get, url, [retry: [base_delay: 0]], "", reducer)
+
+      assert :counters.get(calls, 1) == 2
     end
   end
 end
