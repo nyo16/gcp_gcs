@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed (development)
-- The test suite's local HTTP server is now `GcpGcs.FakeServer` (Bandit plus a
-  dispatching Plug) instead of the unmaintained Bypass, which removes
-  plug_cowboy/cowboy/cowlib/ranch from the test dependencies (and with them
-  cowlib CVE-2026-43966).
+## [0.3.1] - 2026-10-21
+
+### Documentation
+- Corrected the 0.3.0 release notes: the release date, and four behaviour
+  changes that were missing: gcloud runs are killed after `:gcloud_timeout`,
+  a 401 without credentials (emulator mode) is not retried,
+  `clear_auth_cache/0` semantics, and the `upload_stream/4` mailbox
+  constraint with `checksum: true`. No code changes.
 
 ## [0.3.0] - 2026-10-21
 
@@ -130,6 +133,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - With `checksum: true`, `upload_stream/4` gets MD5 replies from a helper
   process in the caller's mailbox: the enumerable (consumed in the caller)
   must not consume messages it doesn't own, e.g. with a catch-all `receive`.
+
+### Changed (development)
+- The test suite's local HTTP server is now `GcpGcs.FakeServer` (Bandit plus a
+  dispatching Plug) instead of the unmaintained Bypass, which removes
+  plug_cowboy/cowboy/cowlib/ranch from the test dependencies (and with them
+  cowlib CVE-2026-43966).
+- Dialyzer runs cleanly under `MIX_ENV=test` (CI): `:ex_unit` is in the PLT.
 
 ### Upgrading from 0.2.x
 
