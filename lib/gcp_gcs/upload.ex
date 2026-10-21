@@ -38,31 +38,55 @@ defmodule GcpGcs.Upload do
   @chunk_multiple 256 * 1024
   @default_chunk_size 8 * 1024 * 1024
 
+  @session_opts [:content_type, :attrs, :origin, :predefined_acl]
+  @resumable_opts @session_opts ++ [:chunk_size, :checksum]
+  @put_opts [:content_type, :predefined_acl, :attrs, :checksum]
+
   @doc """
-  Uploads in-memory `data` in a single request (simple upload).
+  Uploads in-memory `data`.
+
+  Without `:attrs` this is a single simple-upload request. With `:attrs` the
+  upload goes through a resumable session with a known size and a single
+  PUT, so the object metadata is applied (and the `X-Goog-Hash` MD5 is sent).
 
   ## Options
   - `:content_type` — defaults to `"application/octet-stream"`
   - `:predefined_acl` — e.g. `"publicRead"`
-  - `:timeout` — request timeout in ms
+  - `:attrs` — Object resource metadata to set on the new object
+  - `:checksum` — with `:attrs`, `false` skips the MD5 (default `true`)
   """
   @spec put_object(String.t(), String.t(), binary(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def put_object(bucket, object, data, opts \\ []) do
-    Telemetry.span(:upload, %{bucket: bucket, object: object, strategy: :simple}, fn ->
-      do_put_object(bucket, object, data, opts)
+    strategy =
+      if Keyword.keyword?(opts) and Keyword.get(opts, :attrs), do: :resumable, else: :simple
+
+    Telemetry.span(:put_object, %{bucket: bucket, object: object, strategy: strategy}, fn ->
+      with {:ok, _} <- validate_opts(opts, @put_opts),
+           {:ok, _} <- Validation.validate_location(bucket, object),
+           {:ok, _} <- Validation.validate_binary(data, "data"),
+           {:ok, _} <- validate_headers(opts) do
+        put_with(strategy, bucket, object, data, opts)
+      end
     end)
   end
+
+  defp put_with(:simple, bucket, object, data, opts),
+    do: do_put_object(bucket, object, data, opts)
+
+  defp put_with(:resumable, bucket, object, data, opts),
+    do: resumable_put(bucket, object, data, opts)
 
   @doc """
   Uploads from a source, choosing a strategy automatically:
 
-    * a binary → simple upload (`put_object/4`)
+    * a binary → `put_object/4`
     * `{:file, path}` → resumable upload (`upload_file/4`)
     * an `Enumerable` of binaries → resumable streamed upload (`upload_stream/4`)
 
-  Any other source returns `{:error, %GcpGcs.Error{code: :validation_error}}`
-  without making a request.
+  Takes the options of the function it dispatches to. Any other source
+  returns `{:error, %GcpGcs.Error{code: :validation_error}}` without making a
+  request.
   """
   @spec upload(String.t(), String.t(), binary() | {:file, Path.t()} | Enumerable.t(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
@@ -84,24 +108,29 @@ defmodule GcpGcs.Upload do
   Uploads a local file using a resumable session, in chunks read from disk
   (bounded memory). Transient failures resume from the persisted offset.
 
-  Content type defaults to a guess from the object's extension.
+  Content type defaults to a guess from the object's extension. An empty
+  file is a single simple upload, unless `:attrs` or `:origin` is given (then
+  it goes through a resumable session, so they are applied).
 
   ## Options
   - `:content_type` — overrides the guessed content type
   - `:chunk_size` — bytes per request (rounded to a 256 KiB multiple;
     default 8 MiB)
   - `:attrs` — Object resource metadata to set on the new object
+  - `:predefined_acl` — e.g. `"publicRead"`
+  - `:origin` — see `start_resumable_upload/3`
   - `:checksum` — `false` to skip the `X-Goog-Hash` MD5 (default `true`)
-  - `:timeout` — per-request timeout in ms
   """
   @spec upload_file(String.t(), String.t(), Path.t(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def upload_file(bucket, object, path, opts \\ []) do
     Telemetry.span(
-      :upload,
+      :upload_file,
       %{bucket: bucket, object: object, strategy: :resumable, source: path},
       fn ->
-        with {:ok, _} <- Validation.validate_location(bucket, object),
+        with {:ok, _} <- validate_opts(opts, @resumable_opts),
+             {:ok, _} <- Validation.validate_location(bucket, object),
+             {:ok, _} <- validate_headers(opts),
              {:ok, %File.Stat{size: size}} <- stat(path) do
           opts = Keyword.put_new(opts, :content_type, content_type(object, opts))
           upload_file_body(bucket, object, path, size, opts)
@@ -121,14 +150,17 @@ defmodule GcpGcs.Upload do
   - `:content_type` — defaults to `"application/octet-stream"`
   - `:chunk_size` — chunk size in bytes (rounded to a 256 KiB multiple)
   - `:attrs` — Object resource metadata to set on the new object
+  - `:predefined_acl` — e.g. `"publicRead"`
+  - `:origin` — see `start_resumable_upload/3`
   - `:checksum` — `false` to skip the `X-Goog-Hash` MD5 (default `true`)
-  - `:timeout` — per-request timeout in ms
   """
   @spec upload_stream(String.t(), String.t(), Enumerable.t(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
   def upload_stream(bucket, object, enum, opts \\ []) do
-    Telemetry.span(:upload, %{bucket: bucket, object: object, strategy: :resumable}, fn ->
-      with {:ok, _} <- Validation.validate_location(bucket, object),
+    Telemetry.span(:upload_stream, %{bucket: bucket, object: object, strategy: :resumable}, fn ->
+      with {:ok, _} <- validate_opts(opts, @resumable_opts),
+           {:ok, _} <- Validation.validate_location(bucket, object),
+           {:ok, _} <- validate_headers(opts),
            {:ok, _} <- Validation.validate_enumerable(enum, "source"),
            {:ok, session} <- start_session(bucket, object, opts) do
         session
@@ -149,6 +181,7 @@ defmodule GcpGcs.Upload do
   ## Options
   - `:content_type` — value sent as `X-Upload-Content-Type`
   - `:attrs` — Object resource metadata (sent as the JSON request body)
+  - `:predefined_acl` — e.g. `"publicRead"`
   - `:origin` — browser origin to forward as the `Origin` header. Required for
     browser-based resumable uploads (initiate the session server-side, hand the
     session URI to the browser): GCS only returns CORS headers on requests to
@@ -158,14 +191,20 @@ defmodule GcpGcs.Upload do
     never echoed from an incoming request. Mirrors `origin` in Google's official clients
     (e.g. `createResumableUpload` in google-cloud-node,
     `Blob.create_resumable_upload_session` in google-cloud-python).
-  - `:timeout` — request timeout in ms
+
+  `:content_type` and `:origin` must be printable ASCII; anything else is a
+  `:validation_error`.
   """
   @spec start_resumable_upload(String.t(), String.t(), keyword()) ::
           {:ok, String.t()} | {:error, Error.t()}
   def start_resumable_upload(bucket, object, opts \\ []) do
-    with {:ok, _} <- Validation.validate_location(bucket, object) do
-      do_start_resumable_upload(bucket, object, opts)
-    end
+    Telemetry.span(:start_resumable_upload, %{bucket: bucket, object: object}, fn ->
+      with {:ok, _} <- validate_opts(opts, @session_opts),
+           {:ok, _} <- Validation.validate_location(bucket, object),
+           {:ok, _} <- validate_headers(opts) do
+        do_start_resumable_upload(bucket, object, opts)
+      end
+    end)
   end
 
   defp do_start_resumable_upload(bucket, object, opts) do
@@ -190,8 +229,11 @@ defmodule GcpGcs.Upload do
     with {:ok, _status, resp_headers, _body} <-
            Client.exchange(:post, "/b/#{bucket}/o", request_opts) do
       case header_value(resp_headers, "location") do
-        nil -> {:error, Error.new(:internal, "resumable upload session missing Location header")}
-        uri -> {:ok, uri}
+        nil ->
+          {:error, Error.new(:protocol_error, "resumable upload session missing Location header")}
+
+        uri ->
+          {:ok, uri}
       end
     end
   end
@@ -209,7 +251,7 @@ defmodule GcpGcs.Upload do
   - `:offset` — byte offset of this chunk within the object
   - `:total` — total object size if known, or `nil`/omitted for the streaming
     case (intermediate chunks send `/*`)
-  - `:timeout` — request timeout in ms
+  - `:timeout` and the other transport options
 
   ## Returns
   - `{:resume, persisted}` — the session holds bytes `0..persisted - 1` and
@@ -221,13 +263,34 @@ defmodule GcpGcs.Upload do
   @spec upload_chunk(String.t(), binary(), keyword()) ::
           {:ok, map()} | {:resume, non_neg_integer()} | {:error, Error.t()}
   def upload_chunk(session_uri, data, opts) do
-    with {:ok, _} <- Validation.validate_session_uri(session_uri, Client.base_url(opts)),
-         {:ok, _} <- Validation.validate_binary(data, "data"),
-         {:ok, offset} <- Validation.validate_non_neg_integer(opts[:offset], ":offset"),
-         {:ok, total} <- Validation.validate_optional_non_neg_integer(opts[:total], ":total") do
-      put_session(session_uri, data, offset, total, opts, [])
-    end
+    {bucket, object} = session_location(session_uri)
+
+    Telemetry.span(:upload_chunk, %{bucket: bucket, object: object}, fn ->
+      with {:ok, _} <- validate_opts(opts, [:offset, :total]),
+           {:ok, _} <- Validation.validate_session_uri(session_uri, Client.base_url(opts)),
+           {:ok, _} <- Validation.validate_binary(data, "data"),
+           {:ok, offset} <- Validation.validate_non_neg_integer(opts[:offset], ":offset"),
+           {:ok, total} <- Validation.validate_optional_non_neg_integer(opts[:total], ":total") do
+        put_session(session_uri, data, offset, total, opts, [])
+      end
+    end)
   end
+
+  # Bucket and object name from a session URI
+  # (`.../upload/storage/v1/b/<bucket>/o?...&name=<object>&...`), for telemetry.
+  defp session_location(session_uri) when is_binary(session_uri) do
+    uri = URI.parse(session_uri)
+
+    bucket =
+      case String.split(uri.path || "", "/") do
+        ["", "upload", "storage", "v1", "b", bucket | _] -> URI.decode(bucket)
+        _ -> nil
+      end
+
+    {bucket, uri.query && URI.decode_query(uri.query)["name"]}
+  end
+
+  defp session_location(_), do: {nil, nil}
 
   @doc false
   # Asks a resumable session how many bytes it has persisted (`total` if
@@ -260,7 +323,11 @@ defmodule GcpGcs.Upload do
 
           :error ->
             {:error,
-             Error.new(:internal, "malformed Range header in resumable upload response", headers)}
+             Error.new(
+               :protocol_error,
+               "malformed Range header in resumable upload response",
+               headers
+             )}
         end
 
       {:ok, _status, _headers, object} ->
@@ -287,9 +354,25 @@ defmodule GcpGcs.Upload do
     end
   end
 
+  # Metadata in `:attrs` (and a browser `:origin`) only apply through a
+  # resumable session, so in-memory data with :attrs goes through one: known
+  # size, a single PUT (`bytes 0-n/n`, or `bytes */0` when empty).
+  defp resumable_put(bucket, object, data, opts) do
+    with {:ok, session} <- start_session(bucket, object, opts) do
+      session
+      |> transfer(opts)
+      |> finalize(0, data)
+      |> with_session(session)
+    end
+  end
+
   defp upload_file_body(bucket, object, _path, 0, opts) do
-    # Empty file: a simple upload is simplest and correct.
-    do_put_object(bucket, object, "", opts)
+    if opts[:attrs] || opts[:origin] do
+      resumable_put(bucket, object, "", opts)
+    else
+      # Empty file without metadata: a simple upload is simplest and correct.
+      do_put_object(bucket, object, "", opts)
+    end
   end
 
   defp upload_file_body(bucket, object, path, size, opts) do
@@ -301,10 +384,20 @@ defmodule GcpGcs.Upload do
     end
   end
 
+  # Callers have validated their options and the location already.
   defp start_session(bucket, object, opts) do
-    with {:ok, session} <- start_resumable_upload(bucket, object, opts),
+    with {:ok, session} <- do_start_resumable_upload(bucket, object, opts),
          {:ok, _} <- Validation.validate_session_uri(session, Client.base_url(opts)) do
       {:ok, session}
+    end
+  end
+
+  defp validate_opts(opts, keys),
+    do: Validation.validate_opts(opts, keys ++ Client.transport_keys())
+
+  defp validate_headers(opts) do
+    with {:ok, _} <- Validation.validate_header_value(opts[:content_type], ":content_type") do
+      Validation.validate_header_value(opts[:origin], ":origin")
     end
   end
 
@@ -377,7 +470,7 @@ defmodule GcpGcs.Upload do
       t.stalled? ->
         {:error,
          Error.new(
-           :internal,
+           :protocol_error,
            "resumable upload made no progress at offset #{offset}",
            %{persisted: persisted, offset: offset}
          )}
@@ -419,7 +512,7 @@ defmodule GcpGcs.Upload do
         end
 
       {:ok, _object} ->
-        {:error, Error.new(:internal, "resumable upload finished before final chunk")}
+        {:error, Error.new(:protocol_error, "resumable upload finished before final chunk")}
 
       {:error, %Error{}} = error ->
         error
@@ -474,7 +567,7 @@ defmodule GcpGcs.Upload do
 
   defp ahead_of_sent(next, sent_end) do
     Error.new(
-      :internal,
+      :protocol_error,
       "resumable session reported #{next} bytes persisted, but only #{sent_end} were sent",
       %{persisted: next, sent: sent_end}
     )

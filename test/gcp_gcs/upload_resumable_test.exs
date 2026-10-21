@@ -217,6 +217,44 @@ defmodule GcpGcs.UploadResumableTest do
     end
   end
 
+  describe ":attrs on in-memory and empty uploads" do
+    @attrs %{"metadata" => %{"k" => "v"}, "cacheControl" => "no-cache"}
+
+    test "put_object/4 with :attrs uses a session and one PUT", %{bypass: bypass} do
+      server = FakeResumable.start(bypass)
+
+      assert {:ok, _} = GcpGcs.put_object(@bucket, "object.bin", "data", attrs: @attrs)
+
+      assert [%{body: body}] = FakeResumable.posts(server)
+      assert JSON.decode!(body) == @attrs
+      assert [put] = FakeResumable.puts(server)
+      assert put.content_range == "bytes 0-3/4"
+      assert FakeResumable.data(server) == "data"
+    end
+
+    @tag :tmp_dir
+    test "an empty file with :attrs or :origin finalizes with bytes */0", %{
+      bypass: bypass,
+      tmp_dir: tmp_dir
+    } do
+      server = FakeResumable.start(bypass)
+      path = Path.join(tmp_dir, "empty.bin")
+      File.write!(path, "")
+
+      assert {:ok, _} = GcpGcs.upload_file(@bucket, "a.bin", path, attrs: @attrs)
+      assert {:ok, _} = GcpGcs.upload_file(@bucket, "b.bin", path, origin: "https://app.example")
+
+      assert [first, second] = FakeResumable.posts(server)
+      assert JSON.decode!(first.body) == @attrs
+      assert {"origin", "https://app.example"} in second.headers
+
+      assert Enum.map(FakeResumable.puts(server), & &1.content_range) == [
+               "bytes */0",
+               "bytes */0"
+             ]
+    end
+  end
+
   describe "upload_chunk/3 session URI validation" do
     # `other` has no expectations: any request reaching it fails the test.
     setup %{bypass: bypass} do

@@ -25,8 +25,52 @@ defmodule GcpGcs.Error do
       end
   """
 
+  @typedoc """
+  Every error code the library returns.
+
+  HTTP statuses (aligned with Google's `google.rpc.Code` names):
+  `:invalid_argument` (400), `:unauthenticated` (401), `:permission_denied`
+  (403), `:not_found` (404), `:method_not_allowed` (405), `:deadline_exceeded`
+  (408, 504), `:already_exists` (409), `:failed_precondition` (412),
+  `:out_of_range` (413, 416), `:resource_exhausted` (429), `:cancelled` (499),
+  `:internal` (500), `:unimplemented` (501), `:unavailable` (502, 503), and
+  `:unknown` for any other status.
+
+  Client-side:
+
+    * `:validation_error` — invalid input or options; no request was made
+    * `:connection_error` — transport failure (refused, closed, timed out)
+    * `:resource_exhausted` — also: no pooled connection within `:pool_timeout`
+    * `:unauthenticated` — also: no usable credentials
+    * `:protocol_error` — the server's response broke the resumable-upload or
+      rewrite protocol (e.g. no `Location`, a malformed `Range`, no progress)
+    * `:data_loss` — a resumable session lost bytes a stream can no longer resend
+    * `:io_error` — a local file could not be read or written
+  """
+  @type code ::
+          :invalid_argument
+          | :unauthenticated
+          | :permission_denied
+          | :not_found
+          | :method_not_allowed
+          | :deadline_exceeded
+          | :already_exists
+          | :failed_precondition
+          | :out_of_range
+          | :resource_exhausted
+          | :cancelled
+          | :internal
+          | :unimplemented
+          | :unavailable
+          | :unknown
+          | :validation_error
+          | :connection_error
+          | :protocol_error
+          | :data_loss
+          | :io_error
+
   @type t :: %__MODULE__{
-          code: atom(),
+          code: code(),
           message: String.t(),
           details: term(),
           status: non_neg_integer() | nil
@@ -75,7 +119,7 @@ defmodule GcpGcs.Error do
   @doc """
   Creates a new error with the given code and message.
   """
-  @spec new(atom(), String.t(), term()) :: t()
+  @spec new(code(), String.t(), term()) :: t()
   def new(code, message, details \\ nil) do
     %__MODULE__{code: code, message: message, details: details}
   end
@@ -101,7 +145,7 @@ defmodule GcpGcs.Error do
   end
 
   @doc false
-  @spec code_for_status(non_neg_integer()) :: atom()
+  @spec code_for_status(non_neg_integer()) :: code()
   def code_for_status(status), do: Map.get(@status_codes, status, :unknown)
 
   defp extract_message(%{"error" => %{"message" => message}}) when is_binary(message), do: message

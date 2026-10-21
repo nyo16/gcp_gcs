@@ -268,7 +268,7 @@ defmodule GcpGcs.AuthTest do
 
       posts = FakeResumable.posts(server) ++ FakeResumable.posts(other_server)
       assert [_, _] = posts
-      assert Enum.all?(posts, &({"authorization", "Bearer tok"} in &1))
+      assert Enum.all?(posts, &({"authorization", "Bearer tok"} in &1.headers))
 
       puts = FakeResumable.puts(server) ++ FakeResumable.puts(other_server)
       assert [_, _, _] = puts

@@ -6,10 +6,17 @@ defmodule GcpGcs.Download do
   buffers the whole object in memory; `download_to_file/4` and `stream/5` stream
   the body in chunks for constant-memory transfers of large objects.
 
+  Every function also accepts the transport options `:timeout`,
+  `:pool_timeout`, `:retry`, `:finch`, `:goth` and `:base_url` (see
+  `GcpGcs.Config`). Unknown options return
+  `{:error, %GcpGcs.Error{code: :validation_error}}`.
+
   Exposed through the top-level `GcpGcs` module.
   """
 
   alias GcpGcs.{Client, Error, Telemetry, Validation}
+
+  @opts [:generation, :range]
 
   @doc """
   Downloads an object and returns its full contents as a binary.
@@ -21,27 +28,20 @@ defmodule GcpGcs.Download do
   - `:range` — only these bytes: `first..last` or `{first, last}` (inclusive,
     0-based; `{first, nil}` reads to the end). Sent as `Range: bytes=first-last`;
     a `206 Partial Content` response is a success.
-  - `:timeout` — request timeout in ms
   """
   @spec download(String.t(), String.t(), keyword()) :: {:ok, binary()} | {:error, Error.t()}
   def download(bucket, object, opts \\ []) do
     Telemetry.span(:download, %{bucket: bucket, object: object}, fn ->
-      do_download(bucket, object, opts)
-    end)
-  end
-
-  defp do_download(bucket, object, opts) do
-    with {:ok, _} <- Validation.validate_location(bucket, object) do
       reducer = fn
         {:data, chunk}, acc -> [acc, chunk]
         _other, acc -> acc
       end
 
-      case stream_media(bucket, object, opts, [], reducer) do
-        {:ok, {_status, _headers, iodata}} -> {:ok, IO.iodata_to_binary(iodata)}
-        {:error, %Error{}} = error -> error
+      with {:ok, _} <- validate(bucket, object, opts),
+           {:ok, {_status, _headers, iodata}} <- stream_media(bucket, object, opts, [], reducer) do
+        {:ok, IO.iodata_to_binary(iodata)}
       end
-    end
+    end)
   end
 
   @doc """
@@ -49,24 +49,29 @@ defmodule GcpGcs.Download do
 
   The body is written to `path <> ".part"` and renamed to `path` only once the
   download completes, so a partial file never appears at `path`. On any
-  error the `.part` file is removed. Write failures return
-  `{:error, %GcpGcs.Error{code: :io_error}}`.
+  error the `.part` file is removed. Write failures stop the download and
+  return `{:error, %GcpGcs.Error{code: :io_error}}`.
 
-  Returns `:ok`.
+  Takes the options of `download/3`. Returns `:ok`.
   """
   @spec download_to_file(String.t(), String.t(), Path.t(), keyword()) ::
           :ok | {:error, Error.t()}
   def download_to_file(bucket, object, path, opts \\ []) do
-    Telemetry.span(:download, %{bucket: bucket, object: object, destination: path}, fn ->
-      do_download_to_file(bucket, object, path, opts)
-    end)
+    Telemetry.span(
+      :download_to_file,
+      %{bucket: bucket, object: object, destination: path},
+      fn ->
+        with {:ok, _} <- validate(bucket, object, opts) do
+          do_download_to_file(bucket, object, path, opts)
+        end
+      end
+    )
   end
 
   defp do_download_to_file(bucket, object, path, opts) do
     part = path <> ".part"
 
-    with {:ok, _} <- Validation.validate_location(bucket, object),
-         {:ok, io} <- open_file(part) do
+    with {:ok, io} <- open_file(part) do
       result =
         try do
           stream_media(bucket, object, opts, {io, :ok}, &write_chunk/2)
@@ -123,31 +128,61 @@ defmodule GcpGcs.Download do
 
       # Count bytes without buffering the object
       {:ok, total} =
-        GcpGcs.Download.stream("my-bucket", "big.bin", [], 0, fn
+        GcpGcs.Download.stream("my-bucket", "big.bin", 0, fn
           {:data, chunk}, n -> n + byte_size(chunk)
           _other, n -> n
         end)
+
+  ## Deprecated argument order
+
+  Before 0.3.0 the order was `stream(bucket, object, opts, acc, reducer)`.
+  That order is still accepted for one release, with a warning: a call whose
+  **fifth** argument is an arity-2 function and whose third is a keyword list
+  is read as the old order. In the new order the fifth argument is the
+  options list, so it is never a function. (If `acc` is itself an arity-2
+  function, pass the new order — `stream(b, o, acc, reducer)` — which is
+  never ambiguous.)
   """
-  @spec stream(String.t(), String.t(), keyword(), acc, (term(), acc -> acc)) ::
+  @spec stream(String.t(), String.t(), acc, (term(), acc -> term()), keyword()) ::
           {:ok, acc} | {:error, Error.t()}
         when acc: term()
-  def stream(bucket, object, opts, acc, reducer) do
-    Telemetry.span(:download, %{bucket: bucket, object: object}, fn ->
-      do_stream(bucket, object, opts, acc, reducer)
-    end)
-  end
+  def stream(bucket, object, acc, reducer, opts \\ [])
 
-  defp do_stream(bucket, object, opts, acc, reducer) do
-    with {:ok, _} <- Validation.validate_location(bucket, object),
-         {:ok, _} <- Validation.validate_reducer(reducer) do
-      case stream_media(bucket, object, opts, acc, reducer) do
-        {:ok, {_status, _headers, final_acc}} -> {:ok, final_acc}
-        {:error, %Error{}} = error -> error
-      end
+  def stream(bucket, object, opts, acc, reducer)
+      when is_list(opts) and is_function(reducer, 2) do
+    if Keyword.keyword?(opts) do
+      IO.warn(
+        "GcpGcs.download_stream(bucket, object, opts, acc, reducer) is deprecated; " <>
+          "use download_stream(bucket, object, acc, reducer, opts)"
+      )
+
+      stream(bucket, object, acc, reducer, opts)
+    else
+      do_stream(bucket, object, opts, acc, reducer)
     end
   end
 
+  def stream(bucket, object, acc, reducer, opts),
+    do: do_stream(bucket, object, acc, reducer, opts)
+
+  defp do_stream(bucket, object, acc, reducer, opts) do
+    Telemetry.span(:download_stream, %{bucket: bucket, object: object}, fn ->
+      with {:ok, _} <- validate(bucket, object, opts),
+           {:ok, _} <- Validation.validate_reducer(reducer),
+           {:ok, {_status, _headers, final_acc}} <-
+             stream_media(bucket, object, opts, acc, reducer) do
+        {:ok, final_acc}
+      end
+    end)
+  end
+
   # Private
+
+  defp validate(bucket, object, opts) do
+    with {:ok, _} <- Validation.validate_opts(opts, @opts ++ Client.transport_keys()) do
+      Validation.validate_location(bucket, object)
+    end
+  end
 
   defp stream_media(bucket, object, opts, acc, reducer) do
     query = [alt: "media", generation: opts[:generation]]

@@ -54,16 +54,10 @@ defmodule GcpGcs.Auth do
   @spec clear_cache() :: :ok
   def clear_cache, do: Cache.clear()
 
-  @doc """
-  Returns the HTTP headers needed to authenticate a request.
-
-  In emulator mode (without a per-call `:base_url`) returns `{:ok, []}`.
-  Otherwise returns `{:ok, [{"authorization", "Bearer <token>"}]}`.
-
-  ## Options
-  - `:goth` — Goth instance name, overriding `config :gcp_gcs, :goth`
-  - `:base_url` — when set, authentication is never skipped
-  """
+  @doc false
+  # The headers that authenticate a request: `{:ok, []}` in emulator mode
+  # (unless a per-call `:base_url` is set), otherwise the bearer token for
+  # `opts[:goth]` or the configured source.
   @spec request_headers(keyword()) :: {:ok, [{String.t(), String.t()}]} | {:error, Error.t()}
   def request_headers(opts \\ []) do
     if is_nil(opts[:base_url]) and Config.emulator?() do
@@ -76,11 +70,9 @@ defmodule GcpGcs.Auth do
     end
   end
 
-  @doc """
-  Returns a bearer token string (`"Bearer <token>"`).
-
-  Takes the `:goth` option of `request_headers/1`.
-  """
+  @doc false
+  # A bearer token string (`"Bearer <token>"`) for `opts[:goth]` or the
+  # configured source.
   @spec get_token(keyword()) :: {:ok, String.t()} | {:error, Error.t()}
   def get_token(opts \\ []) do
     case opts[:goth] || Application.get_env(:gcp_gcs, :goth) do

@@ -1,32 +1,27 @@
 defmodule GcpGcs.Client do
-  @moduledoc """
-  HTTP transport for the Google Cloud Storage JSON API.
-
-  Wraps `Finch` and handles URL building, authentication, query/body encoding,
-  JSON decoding, response streaming, retries, and error normalization. Most
-  users should use the high-level `GcpGcs` API instead of calling this module
-  directly.
-
-  Three entry points, sharing one response-interpretation path:
-
-    * `request/3` — JSON operations; success is any 2xx, returns the decoded body
-    * `exchange/3` — success is any status listed in `:expect` (e.g. `308`
-      for resumable uploads); returns status, headers and the decoded body
-    * `stream/5` — streams the response body through a reducer (used by downloads)
-
-  `path` is either relative to the API root (`"/b/bucket/o"`, resolved against
-  the JSON or upload API with `api: :json | :upload`) or an absolute URL (a
-  resumable session URI).
-
-  ## Retries
-
-  Idempotent requests (GET and HEAD, or any request marked `idempotent: true`)
-  are retried on 408, 429, 500, 502, 503 and 504 responses and on closed,
-  timed-out or refused connections, with exponential backoff and full jitter,
-  honouring `Retry-After`. Streams are retried only while the reducer has not
-  been called. A `401` on an authenticated request clears the token cache and
-  is retried once. See `GcpGcs.Config` for the settings.
-  """
+  @moduledoc false
+  # HTTP transport for the Google Cloud Storage JSON API (internal).
+  #
+  # Wraps Finch and handles URL building, authentication, query/body encoding,
+  # JSON decoding, response streaming, retries, and error normalization.
+  #
+  # Three entry points, sharing one response-interpretation path:
+  #
+  #   * request/3 — JSON operations; success is any 2xx, returns the decoded body
+  #   * exchange/3 — success is any status listed in :expect (e.g. 308 for
+  #     resumable uploads); returns status, headers and the decoded body
+  #   * stream/5 — streams the response body through a reducer (downloads)
+  #
+  # `path` is either relative to the API root ("/b/bucket/o", resolved against
+  # the JSON or upload API with `api: :json | :upload`) or an absolute URL (a
+  # resumable session URI).
+  #
+  # Retries: idempotent requests (GET and HEAD, or any request marked
+  # `idempotent: true`) are retried on 408, 429, 500, 502, 503 and 504
+  # responses and on closed, timed-out or refused connections, with
+  # exponential backoff and full jitter, honouring Retry-After. Streams are
+  # retried only while the reducer has not been called. A 401 on an
+  # authenticated request clears the token cache and is retried once.
 
   alias GcpGcs.{Auth, Config, Error}
 
@@ -196,6 +191,11 @@ defmodule GcpGcs.Client do
   # The caller options that domain modules forward to the transport.
   @spec transport_opts(keyword()) :: keyword()
   def transport_opts(opts), do: Keyword.take(opts, @transport_opts)
+
+  @doc false
+  # The transport option names every public function accepts.
+  @spec transport_keys() :: [atom()]
+  def transport_keys, do: @transport_opts
 
   @doc false
   @spec object_path(String.t(), String.t()) :: String.t()

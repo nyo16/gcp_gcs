@@ -1,19 +1,8 @@
 defmodule GcpGcs.Application do
-  @moduledoc """
-  Starts the supervision tree for `GcpGcs`.
-
-  Two children are supervised:
-
-    * `GcpGcs.Auth`'s cache — an internal GenServer that owns the ETS table
-      backing the access-token cache
-    * `Finch` — the HTTP connection pool used for all requests, unless
-      `config :gcp_gcs, :start_finch, false` (then name your own instance with
-      `config :gcp_gcs, :finch_name`)
-
-  The Finch pool is sized from `config :gcp_gcs, :finch` and targets either the
-  production endpoint (`storage.googleapis.com`) or a configured emulator. See
-  `GcpGcs.Config`.
-  """
+  @moduledoc false
+  # Supervises GcpGcs.Auth.Cache (owner of the access-token ETS table) and,
+  # unless `config :gcp_gcs, :start_finch, false`, the Finch pool used for all
+  # requests, sized from `config :gcp_gcs, :finch` (see GcpGcs.Config).
   use Application
 
   alias GcpGcs.Config

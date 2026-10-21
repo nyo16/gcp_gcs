@@ -27,7 +27,7 @@ token caching, and telemetry.
 ```elixir
 def deps do
   [
-    {:gcp_gcs, "~> 0.2.2"},
+    {:gcp_gcs, "~> 0.3.0"},
     {:goth, "~> 1.4"}  # optional, service-account auth
   ]
 end
@@ -64,10 +64,16 @@ object["contentType"]  #=> "text/plain"
 
 # List objects (with pagination info)
 {:ok, %{items: items, next_page_token: token}} = GcpGcs.list_objects("my-bucket")
+
+# ...or every object, fetched lazily page by page (raises GcpGcs.Error on failure)
+"my-bucket" |> GcpGcs.stream_objects!(page_size: 1000) |> Stream.map(& &1["name"]) |> Enum.take(5)
 ```
 
-Every call returns `{:ok, result}` / `:ok`, or `{:error, %GcpGcs.Error{}}`.
-Responses are decoded JSON resources — plain maps with string keys.
+Every call returns `{:ok, result}` / `:ok`, or `{:error, %GcpGcs.Error{}}`; only
+the lazy `stream_objects!/2` and `stream_buckets!/2` raise. Resources are
+decoded JSON — plain maps with string keys; list results are atom-keyed
+wrappers (`%{items: ..., next_page_token: ...}`) around them. Unknown options
+are rejected with `:validation_error`.
 
 ## Uploads
 
@@ -75,12 +81,15 @@ Responses are decoded JSON resources — plain maps with string keys.
 # Simple (in-memory) upload
 {:ok, _} = GcpGcs.put_object("my-bucket", "notes.txt", "some text")
 
-# Resumable streamed upload of a local file (constant memory)
+# Resumable upload of a local file, in 8 MiB chunks read from disk
 {:ok, _} = GcpGcs.upload_file("my-bucket", "video.mp4", "/path/to/video.mp4")
 
 # Resumable upload from any enumerable of binaries
 chunks = Stream.repeatedly(fn -> :crypto.strong_rand_bytes(1_000_000) end) |> Stream.take(10)
 {:ok, _} = GcpGcs.upload_stream("my-bucket", "random.bin", chunks)
+
+# In-memory data with object metadata (goes through a resumable session)
+{:ok, _} = GcpGcs.put_object("my-bucket", "a.json", "{}", attrs: %{"cacheControl" => "no-cache"})
 
 # Let the library pick the strategy
 {:ok, _} = GcpGcs.upload("my-bucket", "a.txt", "inline data")
@@ -90,6 +99,14 @@ chunks = Stream.repeatedly(fn -> :crypto.strong_rand_bytes(1_000_000) end) |> St
 Content type is guessed from the object's extension for `upload_file/4`; pass
 `content_type:` to override. Resumable chunk size defaults to 8 MiB and can be
 tuned with `chunk_size:` (rounded to a 256 KiB multiple).
+
+Resumable uploads survive transient failures (5xx, 429, dropped connections):
+they ask the session how much it persisted and resume from there.
+`upload_file/4` can resume from any offset; `upload_stream/4` holds at most
+one chunk and returns `:data_loss` if the server lost more. The final request
+carries an MD5 `X-Goog-Hash` of the whole object, so GCS rejects corrupted
+uploads (`checksum: false` to disable). After a session exists, errors carry
+`details: %{session_uri: uri, cause: ...}` for manual resumption.
 
 ### Low-level resumable control
 
@@ -124,13 +141,19 @@ session for exactly that origin.
 # Stream straight to disk (constant memory)
 :ok = GcpGcs.download_to_file("my-bucket", "report.pdf", "/tmp/report.pdf")
 
-# Fold the body through your own reducer
+# Fold the body through your own reducer; return {:halt, acc} to stop early
 {:ok, byte_count} =
-  GcpGcs.download_stream("my-bucket", "big.bin", [], 0, fn
+  GcpGcs.download_stream("my-bucket", "big.bin", 0, fn
     {:data, chunk}, n -> n + byte_size(chunk)
     _other, n -> n
   end)
+
+# Byte ranges (inclusive): a 206 Partial Content is a success
+{:ok, first_kib} = GcpGcs.download("my-bucket", "big.bin", range: 0..1023)
 ```
+
+`download_to_file/4` writes to `path <> ".part"` and renames it into place
+when complete, so a partial file never appears at `path`.
 
 ## Listing a "directory"
 
@@ -173,11 +196,14 @@ case GcpGcs.get_object("my-bucket", "missing.txt") do
 end
 ```
 
-`code` is a stable atom mapped from the HTTP status: `:not_found`,
-`:already_exists`, `:permission_denied`, `:unauthenticated`,
-`:invalid_argument`, `:failed_precondition`, `:resource_exhausted`,
-`:unavailable`, `:validation_error`, `:connection_error`, … The original
-decoded body / exception is preserved in `details`.
+`code` is a stable atom (`t:GcpGcs.Error.code/0` lists them all). HTTP
+statuses map to `:not_found`, `:already_exists`, `:permission_denied`,
+`:unauthenticated`, `:invalid_argument`, `:failed_precondition`,
+`:resource_exhausted`, `:unavailable`, …; client-side failures are
+`:validation_error` (nothing was sent), `:connection_error`,
+`:protocol_error` (the server broke the resumable/rewrite protocol),
+`:data_loss` and `:io_error`. The original decoded body / exception is
+preserved in `details`.
 
 ## Configuration
 
@@ -286,9 +312,14 @@ credentials.
 )
 ```
 
-Request metadata includes bucket and object names; `upload_file/4` and
-`download_to_file/4` also carry local file paths (`:source`/`:destination`).
-Treat telemetry metadata as potentially sensitive before exporting it.
+Each public function emits one `[:gcp_gcs, :request, _]` span covering all of
+its HTTP calls (retries, chunks, rewrite steps); `:operation` names the
+function (`:put_object`, `:upload_file`, `:upload_stream`, `:download`,
+`:download_to_file`, `:download_stream`, `:list_objects`, …). Metadata always
+has `:bucket` and `:object` (the destination for copy/rewrite/move);
+`upload_file/4` and `download_to_file/4` also carry local file paths
+(`:source`/`:destination`). Treat telemetry metadata as potentially sensitive
+before exporting it.
 
 ## Testing
 

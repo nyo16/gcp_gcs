@@ -48,12 +48,14 @@ defmodule GcpGcs.FakeResumable do
   @spec puts(t()) :: [map()]
   def puts(pid), do: pid |> Agent.get(& &1.puts) |> Enum.reverse()
 
-  @doc "Initiation POSTs received (their request headers), oldest first."
-  @spec posts(t()) :: [[{String.t(), String.t()}]]
+  @doc "Initiation POSTs received (`%{headers: ..., body: ...}`), oldest first."
+  @spec posts(t()) :: [map()]
   def posts(pid), do: pid |> Agent.get(& &1.posts) |> Enum.reverse()
 
   defp handle(%Plug.Conn{method: "POST"} = conn, pid, bypass) do
-    Agent.update(pid, &%{&1 | posts: [conn.req_headers | &1.posts]})
+    {:ok, body, conn} = Plug.Conn.read_body(conn)
+    post = %{headers: conn.req_headers, body: body}
+    Agent.update(pid, &%{&1 | posts: [post | &1.posts]})
 
     conn
     |> Plug.Conn.put_resp_header("location", session_uri(bypass))

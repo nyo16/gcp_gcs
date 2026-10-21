@@ -50,4 +50,89 @@ defmodule GcpGcs.TelemetryTest do
     assert_received {:telemetry, [:gcp_gcs, :request, :exception], %{duration: _},
                      %{operation: :telemetry_test, kind: :error, reason: %RuntimeError{}}}
   end
+
+  describe "operation names and metadata" do
+    import GcpGcs.EnvHelper
+
+    alias GcpGcs.FakeResumable
+
+    setup do
+      bypass = Bypass.open()
+      put_emulator_for_test(bypass.port)
+      {:ok, bypass: bypass}
+    end
+
+    defp stops do
+      receive do
+        {:telemetry, [:gcp_gcs, :request, :stop], _measurements, meta} -> [meta | stops()]
+      after
+        0 -> []
+      end
+    end
+
+    @tag :tmp_dir
+    test "uploads and downloads report their own operation", %{
+      bypass: bypass,
+      tmp_dir: tmp_dir
+    } do
+      server = FakeResumable.start(bypass)
+      path = Path.join(tmp_dir, "f.bin")
+      File.write!(path, "abc")
+      bucket = "test-bucket"
+
+      {:ok, _} = GcpGcs.upload_file(bucket, "f.bin", path)
+      {:ok, _} = GcpGcs.upload_stream(bucket, "s.bin", ["abc"])
+      {:ok, session} = GcpGcs.start_resumable_upload(bucket, "c.bin")
+      {:ok, _} = GcpGcs.upload_chunk(session, "abc", offset: 0, total: 3)
+      _ = FakeResumable.data(server)
+
+      assert [
+               %{operation: :upload_file, bucket: ^bucket, object: "f.bin", source: ^path},
+               %{operation: :upload_stream, bucket: ^bucket, object: "s.bin"},
+               %{operation: :start_resumable_upload, bucket: ^bucket, object: "c.bin"},
+               # The fake session URI names no object; the bucket comes from its path.
+               %{operation: :upload_chunk, bucket: ^bucket, object: nil, result: :ok}
+             ] = stops()
+
+      dest = Path.join(tmp_dir, "out.bin")
+
+      Bypass.expect(bypass, "GET", "/storage/v1/b/#{bucket}/o/x", fn conn ->
+        Plug.Conn.resp(conn, 200, "x")
+      end)
+
+      {:ok, _} = GcpGcs.download(bucket, "x")
+      :ok = GcpGcs.download_to_file(bucket, "x", dest)
+      {:ok, _} = GcpGcs.download_stream(bucket, "x", nil, fn _, acc -> acc end)
+
+      assert [
+               %{operation: :download, object: "x"},
+               %{operation: :download_to_file, object: "x", destination: ^dest},
+               %{operation: :download_stream, object: "x"}
+             ] = stops()
+    end
+
+    test "put_object reports its strategy; bucket ops carry object: nil" do
+      assert {:error, _} = GcpGcs.put_object("BAD-bucket", "o", "d")
+      assert {:error, _} = GcpGcs.put_object("BAD-bucket", "o", "d", attrs: %{})
+      assert {:error, _} = GcpGcs.list_objects("BAD-bucket")
+
+      assert [
+               %{operation: :put_object, strategy: :simple},
+               %{operation: :put_object, strategy: :resumable},
+               %{operation: :list_objects, bucket: "BAD-bucket", object: nil}
+             ] = stops()
+    end
+
+    test "copy, rewrite and move name the destination as bucket/object" do
+      assert {:error, _} = GcpGcs.copy_object("src-bkt", "a", "BAD-dst", "b")
+      assert {:error, _} = GcpGcs.rewrite_object("src-bkt", "a", "BAD-dst", "b")
+      assert {:error, _} = GcpGcs.move_object("BAD-bkt", "a", "b")
+
+      assert [
+               %{operation: :copy_object, bucket: "BAD-dst", object: "b", src_bucket: "src-bkt"},
+               %{operation: :rewrite_object, bucket: "BAD-dst", object: "b", src_object: "a"},
+               %{operation: :move_object, bucket: "BAD-bkt", object: "b", src_object: "a"}
+             ] = stops()
+    end
+  end
 end

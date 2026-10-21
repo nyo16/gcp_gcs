@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-20
+
+### Breaking
+- **Unknown options are rejected.** Every public function validates its
+  options (`Keyword.validate/2`) against its documented keys plus the
+  transport options; anything else returns `{:error, %GcpGcs.Error{code:
+  :validation_error, details: {:unknown_options, keys}}}` instead of being
+  silently ignored (e.g. `list_objects(b, max_results: 10)`).
+- **`download_stream` argument order** is now
+  `download_stream(bucket, object, acc, reducer, opts \\ [])` (also
+  `GcpGcs.Download.stream/5`). The old `(bucket, object, opts, acc, reducer)`
+  order still works for this release and emits a deprecation warning.
+- **Telemetry operation names**: uploads and downloads report
+  `:put_object`, `:upload_file`, `:upload_stream`, `:download`,
+  `:download_to_file` and `:download_stream` instead of `:upload` /
+  `:download`. Metadata always includes `:bucket` and `:object`; for
+  copy/rewrite/move they are the destination (source in `:src_bucket` /
+  `:src_object`, replacing `:dst_bucket` / `:dst_object`). New spans for
+  `start_resumable_upload/3` and `upload_chunk/3`. The event name
+  `[:gcp_gcs, :request]` is unchanged and documented as operation-scoped.
+- **Error vocabulary**: client-side protocol violations (missing `Location`,
+  malformed `Range`, no progress, unexpected rewrite response) use the new
+  code `:protocol_error` instead of `:internal`, which now only means HTTP
+  500. `t:GcpGcs.Error.code/0` enumerates every code.
+- **Public surface**: GcpGcs.Client and GcpGcs.Application are internal
+  (`@moduledoc false`); `GcpGcs.Config` documents config keys only;
+  `GcpGcs.Auth`'s public function is `clear_cache/0` (use
+  `GcpGcs.clear_auth_cache/0`); GcpGcs.Telemetry's `span/3` and `auth_span/2`
+  are internal.
+- **List results**: `list_buckets/2` pages no longer contain `prefixes`
+  (only object listings have them).
+- **Stricter validation**: bucket names with `..`, `.-` or `-.`, object names
+  with C0 control characters or invalid UTF-8, and `:origin` /
+  `:content_type` values that are not printable ASCII are rejected with
+  `:validation_error` before any request (previously a GCS 400 or a Mint
+  `:connection_error`).
+- **Retries are on by default** for idempotent requests (see Added). Pass
+  `retry: false` or `config :gcp_gcs, :retry, max_attempts: 1` for the old
+  behaviour.
+- **Default pool**: `pool_count` defaults to `System.schedulers_online()` with
+  10 connections per shard (was one shard of 25).
+- **Goth tokens are no longer cached in ETS** — Goth caches them itself.
+- After a resumable session exists, an error's `details` is
+  `%{session_uri: uri, cause: original_details}`.
+
+### Added
+- Per-call `:goth`, `:finch` and `:base_url` options (a per-call base URL
+  keeps authentication on); `config :gcp_gcs, :finch_name` and
+  `config :gcp_gcs, :start_finch, false` to use your own Finch instance.
+- Bounded retries with exponential backoff and full jitter for idempotent
+  requests on 408/429/5xx and dropped connections, honouring `Retry-After`
+  (`config :gcp_gcs, :retry`, per-call `:retry`). A 401 clears the token
+  cache and retries once.
+- Resumable uploads recover from transient failures by querying the session
+  and resuming from the persisted offset; `upload_file/4` now uploads in
+  chunks read with `pread` (8 MiB by default) and can resume from any offset.
+- `X-Goog-Hash` MD5 of the whole object on the final resumable request
+  (`checksum: false` disables it).
+- `GcpGcs.stream_objects!/2` and `GcpGcs.stream_buckets!/2`: lazy pagination
+  (the only raising functions); `GcpGcs.Error` is now an exception.
+- `:fields` on `list_objects/2` and `list_buckets/2`.
+- `:range` on `download/3`, `download_to_file/4` and `download_stream`;
+  download reducers may return `{:halt, acc}` to stop early.
+- `put_object/4` with `:attrs`, and empty `upload_file/4` with `:attrs` or
+  `:origin`, go through a resumable session so the metadata is applied
+  (previously dropped). `:predefined_acl` documented on
+  `upload_file/4`/`upload_stream/4`.
+- `config :gcp_gcs, :emulator_env, false` ignores `STORAGE_EMULATOR_HOST`; a
+  non-loopback emulator host is logged as an error at boot.
+- gcloud auth: tokens are cached until shortly before their real expiry
+  (refreshed at 80% of the TTL), fetched once under concurrent demand, and
+  failures are cached for 5 s; `config :gcp_gcs, :gcloud_path` and
+  `config :gcp_gcs, :gcloud_fallback, false`.
+- `:request_timeout` (overall deadline for metadata calls), opt-in HTTP/2
+  via `config :gcp_gcs, :finch, protocols: [:http2]`, `@spec`s on every
+  `GcpGcs` function.
+
+### Changed
+- The endpoint (emulator or production) is resolved once at application
+  start. Finch's `:default` pool uses the same strict TLS settings.
+- Non-2xx download bodies are buffered up to 64 KiB for the error.
+- The token cache table is `:protected`; only its owner process writes it.
+
+### Upgrading from 0.2.x
+
+1. Run your test suite and look for `:validation_error` with
+   `details: {:unknown_options, keys}` — fix or drop those options.
+2. Reorder `GcpGcs.download_stream(b, o, opts, acc, reducer)` calls to
+   `GcpGcs.download_stream(b, o, acc, reducer, opts)` (the old order warns).
+3. Telemetry handlers matching `operation: :upload` / `:download` should
+   match the new names; handlers reading `:dst_bucket`/`:dst_object` should
+   read `:bucket`/`:object`.
+4. Code matching `%GcpGcs.Error{code: :internal}` for resumable/rewrite
+   failures should match `:protocol_error`.
+5. Replace direct calls to GcpGcs.Client, GcpGcs.Auth's `get_token` /
+   `request_headers`, or GcpGcs.Config functions; they are internal now.
+6. If you relied on a single 25-connection pool, set
+   `config :gcp_gcs, :finch, pool_size: 25, pool_count: 1`.
+7. If writes must never be retried at all, set
+   `config :gcp_gcs, :retry, max_attempts: 1` (non-idempotent requests are
+   never retried by default anyway).
+
 ## [0.2.2] - 2026-10-20
 
 ### Security

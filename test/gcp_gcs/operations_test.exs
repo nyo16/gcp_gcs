@@ -84,7 +84,7 @@ defmodule GcpGcs.OperationsTest do
       end
 
       assert {:error, %Error{code: :not_found}} =
-               Download.stream(@bucket, "obj", [], :acc, reducer)
+               Download.stream(@bucket, "obj", :acc, reducer)
 
       refute_received {:data, _}
     end
@@ -105,7 +105,7 @@ defmodule GcpGcs.OperationsTest do
         _other, acc -> acc
       end
 
-      assert {:ok, iodata} = GcpGcs.download_stream(@bucket, "obj", [], [], reducer)
+      assert {:ok, iodata} = GcpGcs.download_stream(@bucket, "obj", [], reducer)
       assert IO.iodata_to_binary(iodata) == "one,two,three"
     end
 
@@ -147,7 +147,7 @@ defmodule GcpGcs.OperationsTest do
         _other, acc -> acc
       end
 
-      assert {:ok, ["first"]} = GcpGcs.download_stream(@bucket, "obj", [], [], reducer)
+      assert {:ok, ["first"]} = GcpGcs.download_stream(@bucket, "obj", [], reducer)
     end
 
     test "a large error body is truncated to 64 KiB", %{bypass: bypass} do

@@ -43,6 +43,10 @@ defmodule GcpGcs.Validation do
       String.contains?(bucket, "google") ->
         {:error, Error.new(:validation_error, "bucket must not contain 'google'")}
 
+      String.contains?(bucket, ["..", ".-", "-."]) ->
+        {:error,
+         Error.new(:validation_error, "bucket must not contain '..', '.-' or '-.' sequences")}
+
       true ->
         {:ok, bucket}
     end
@@ -65,9 +69,11 @@ defmodule GcpGcs.Validation do
       object in [".", ".."] ->
         {:error, Error.new(:validation_error, "object name must not be '.' or '..'")}
 
-      String.contains?(object, ["\r", "\n"]) ->
-        {:error,
-         Error.new(:validation_error, "object name must not contain carriage return or line feed")}
+      not String.valid?(object) ->
+        {:error, Error.new(:validation_error, "object name must be valid UTF-8")}
+
+      String.match?(object, ~r/[\x00-\x1F]/) ->
+        {:error, Error.new(:validation_error, "object name must not contain control characters")}
 
       true ->
         {:ok, object}
@@ -76,6 +82,48 @@ defmodule GcpGcs.Validation do
 
   def validate_object(_) do
     {:error, Error.new(:validation_error, "object name must be a string")}
+  end
+
+  @spec validate_opts(term(), [atom()]) :: {:ok, keyword()} | {:error, Error.t()}
+  def validate_opts(opts, allowed) when is_list(opts) do
+    with true <- Keyword.keyword?(opts),
+         {:ok, _} <- Keyword.validate(opts, allowed) do
+      {:ok, opts}
+    else
+      false ->
+        {:error, Error.new(:validation_error, "options must be a keyword list")}
+
+      {:error, unknown} ->
+        {:error,
+         Error.new(
+           :validation_error,
+           "unknown options #{inspect(unknown)}; allowed: #{inspect(Enum.sort(allowed))}",
+           {:unknown_options, unknown}
+         )}
+    end
+  end
+
+  def validate_opts(_opts, _allowed) do
+    {:error, Error.new(:validation_error, "options must be a keyword list")}
+  end
+
+  # Values that end up in request headers (`:origin`, `:content_type`): visible
+  # ASCII and spaces only, so a CR/LF can't split headers and the request fails
+  # here rather than as a Mint :connection_error.
+  @spec validate_header_value(term(), String.t()) :: {:ok, term()} | {:error, Error.t()}
+  def validate_header_value(nil, _field), do: {:ok, nil}
+
+  def validate_header_value(value, field) when is_binary(value) do
+    if String.match?(value, ~r/\A[\x20-\x7E]+\z/),
+      do: {:ok, value},
+      else: header_value_error(field)
+  end
+
+  def validate_header_value(_value, field), do: header_value_error(field)
+
+  defp header_value_error(field) do
+    {:error,
+     Error.new(:validation_error, "#{field} must be a non-empty string of printable ASCII")}
   end
 
   @doc "Validates a bucket/object pair."

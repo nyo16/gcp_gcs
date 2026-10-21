@@ -91,37 +91,40 @@ defmodule GcpGcs.Config do
 
   @type emulator :: %{scheme: String.t(), host: String.t(), port: pos_integer()}
 
-  @doc "The name of the Finch instance used for requests (`config :gcp_gcs, :finch_name`)."
+  @doc false
+  # The Finch instance used for requests (`config :gcp_gcs, :finch_name`).
   @spec finch_name() :: atom()
   def finch_name, do: Application.get_env(:gcp_gcs, :finch_name, @default_finch_name)
 
-  @doc "Whether `GcpGcs.Application` starts its own Finch instance (`config :gcp_gcs, :start_finch`)."
+  @doc false
+  # Whether GcpGcs.Application starts its own Finch (`config :gcp_gcs, :start_finch`).
   @spec start_finch?() :: boolean()
   def start_finch?, do: Application.get_env(:gcp_gcs, :start_finch, true)
 
-  @doc "Default request timeout in milliseconds."
+  @doc false
   @spec default_timeout() :: pos_integer()
   def default_timeout do
     Application.get_env(:gcp_gcs, :default_timeout, @default_timeout)
   end
 
-  @doc "Max wait in milliseconds for a pooled connection."
+  @doc false
   @spec pool_timeout() :: pos_integer()
   def pool_timeout do
     Application.get_env(:gcp_gcs, :pool_timeout, @default_pool_timeout)
   end
 
-  @doc "Retry settings: `max_attempts`, `base_delay` and `max_delay` (ms)."
+  @doc false
+  # Retry settings: `max_attempts`, `base_delay` and `max_delay` (ms).
   @spec retry() :: keyword()
   def retry do
     Keyword.merge(@default_retry, Application.get_env(:gcp_gcs, :retry, []))
   end
 
-  @doc "The gcloud executable used by the CLI auth fallback."
+  @doc false
   @spec gcloud_path() :: String.t()
   def gcloud_path, do: Application.get_env(:gcp_gcs, :gcloud_path, "gcloud")
 
-  @doc "Whether the gcloud CLI auth fallback is enabled."
+  @doc false
   @spec gcloud_fallback?() :: boolean()
   def gcloud_fallback?, do: Application.get_env(:gcp_gcs, :gcloud_fallback, true)
 
@@ -129,30 +132,28 @@ defmodule GcpGcs.Config do
   # application start, and served from :persistent_term on every request.
   @endpoint_key {__MODULE__, :endpoint}
 
-  @doc """
-  The scheme/host/port requests go to (and the Finch pool connects to).
-
-  Returns `{scheme, host, port}` where `scheme` is `:http` or `:https`.
-  """
+  @doc false
+  # `{scheme, host, port}` requests go to (and the Finch pool connects to).
   @spec endpoint() :: {:http | :https, String.t(), pos_integer()}
   def endpoint do
     %{scheme: scheme, host: host, port: port} = resolved()
     {scheme, host, port}
   end
 
-  @doc "Base URL of the API host, e.g. `https://storage.googleapis.com`."
+  @doc false
   @spec base_url() :: String.t()
   def base_url, do: resolved().base_url
 
-  @doc "Base URL for JSON metadata operations, e.g. `.../storage/v1`."
+  @doc false
   @spec json_base() :: String.t()
   def json_base, do: base_url() <> "/storage/v1"
 
-  @doc "Base URL for media/resumable uploads, e.g. `.../upload/storage/v1`."
+  @doc false
   @spec upload_base() :: String.t()
   def upload_base, do: base_url() <> "/upload/storage/v1"
 
-  @doc "Whether an emulator is configured (auth is skipped when true)."
+  @doc false
+  # Whether an emulator is configured (auth is skipped when true).
   @spec emulator?() :: boolean()
   def emulator?, do: resolved().emulator?
 
