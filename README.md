@@ -135,7 +135,8 @@ session for exactly that origin.
 ## Downloads
 
 ```elixir
-# Whole object into memory
+# Whole object into memory (peak about 2x its size while the body is joined;
+# use download_to_file or download_stream for large objects)
 {:ok, bytes} = GcpGcs.download("my-bucket", "report.pdf")
 
 # Stream straight to disk (constant memory)
@@ -309,7 +310,8 @@ children = [
 ```
 
 Call `GcpGcs.clear_auth_cache/0` to force a token refresh after rotating
-credentials.
+credentials. It returns at once, and requests made after it fetch a new token,
+even while an earlier gcloud run is still in progress.
 
 ## Telemetry
 
@@ -334,6 +336,10 @@ has `:bucket` and `:object` (the destination for copy/rewrite/move);
 `upload_file/4` and `download_to_file/4` also carry local file paths
 (`:source`/`:destination`). Treat telemetry metadata as potentially sensitive
 before exporting it.
+
+`[:gcp_gcs, :auth, _]` spans are emitted only when the gcloud fallback actually
+runs `gcloud` (a cache miss or refresh), with `source: :gcloud`. Goth token
+reads emit nothing here; use Goth's own telemetry for its refreshes.
 
 ## Testing
 
