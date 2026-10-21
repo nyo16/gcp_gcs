@@ -1,6 +1,6 @@
 defmodule GcpGcs.FakeResumable do
   @moduledoc false
-  # A minimal GCS resumable-upload session for Bypass, faithful to the wire
+  # A minimal GCS resumable-upload session for `GcpGcs.FakeServer`, faithful to the wire
   # protocol: the initiation POST returns a session URI in `Location`; each
   # session PUT carries `Content-Range`, and the server answers `308` with
   # `Range: bytes=0-N` (omitted when nothing is persisted) until the final byte
@@ -20,24 +20,26 @@ defmodule GcpGcs.FakeResumable do
 
   use Agent
 
+  alias GcpGcs.FakeServer
+
   @session_path "/upload/storage/v1/b/test-bucket/o"
 
   @type t :: pid()
 
-  @spec start(Bypass.t(), (non_neg_integer(), map() -> term())) :: t()
-  def start(bypass, policy \\ fn _i, _req -> :all end) do
+  @spec start(FakeServer.t(), (non_neg_integer(), map() -> term())) :: t()
+  def start(fake, policy \\ fn _i, _req -> :all end) do
     {:ok, pid} =
       Agent.start_link(fn ->
         %{data: "", puts: [], posts: [], policy: policy, total: nil}
       end)
 
-    Bypass.expect(bypass, fn conn -> handle(conn, pid, bypass) end)
+    FakeServer.expect(fake, fn conn -> handle(conn, pid, fake) end)
     pid
   end
 
-  @spec session_uri(Bypass.t()) :: String.t()
-  def session_uri(bypass) do
-    "http://localhost:#{bypass.port}#{@session_path}?uploadType=resumable&upload_id=fake"
+  @spec session_uri(FakeServer.t()) :: String.t()
+  def session_uri(fake) do
+    "http://localhost:#{fake.port}#{@session_path}?uploadType=resumable&upload_id=fake"
   end
 
   @doc "Bytes the server has persisted so far."
@@ -52,13 +54,13 @@ defmodule GcpGcs.FakeResumable do
   @spec posts(t()) :: [map()]
   def posts(pid), do: pid |> Agent.get(& &1.posts) |> Enum.reverse()
 
-  defp handle(%Plug.Conn{method: "POST"} = conn, pid, bypass) do
+  defp handle(%Plug.Conn{method: "POST"} = conn, pid, fake) do
     {:ok, body, conn} = Plug.Conn.read_body(conn)
     post = %{headers: conn.req_headers, body: body}
     Agent.update(pid, &%{&1 | posts: [post | &1.posts]})
 
     conn
-    |> Plug.Conn.put_resp_header("location", session_uri(bypass))
+    |> Plug.Conn.put_resp_header("location", session_uri(fake))
     |> Plug.Conn.resp(200, "")
   end
 

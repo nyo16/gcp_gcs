@@ -9,7 +9,7 @@ defmodule GcpGcs.AuthTest do
 
   import GcpGcs.EnvHelper
 
-  alias GcpGcs.{Auth, Error, FakeResumable, Upload}
+  alias GcpGcs.{Auth, Error, FakeResumable, FakeServer, Upload}
   alias GcpGcs.Auth.Cache
 
   @moduletag :tmp_dir
@@ -238,16 +238,16 @@ defmodule GcpGcs.AuthTest do
   describe "authenticated requests against a per-call :base_url" do
     setup %{bin: bin} do
       fake_gcloud(bin, "tok")
-      bypass = Bypass.open()
-      {:ok, bypass: bypass, base_url: "http://localhost:#{bypass.port}"}
+      fake = FakeServer.open()
+      {:ok, fake: fake, base_url: "http://localhost:#{fake.port}"}
     end
 
     test "the initiation POST is authenticated, session PUTs are not", %{
-      bypass: bypass,
+      fake: fake,
       base_url: base_url,
       tmp_dir: tmp_dir
     } do
-      server = FakeResumable.start(bypass)
+      server = FakeResumable.start(fake)
       path = Path.join(tmp_dir, "payload.bin")
       File.write!(path, :crypto.strong_rand_bytes(300_000))
 
@@ -257,7 +257,7 @@ defmodule GcpGcs.AuthTest do
                  chunk_size: 262_144
                )
 
-      other = Bypass.open()
+      other = FakeServer.open()
       other_url = "http://localhost:#{other.port}"
       other_server = FakeResumable.start(other)
 
@@ -276,14 +276,14 @@ defmodule GcpGcs.AuthTest do
     end
 
     test "a 401 refetches the token once and retries", %{
-      bypass: bypass,
+      fake: fake,
       base_url: base_url,
       bin: bin,
       runs: runs
     } do
       test_pid = self()
 
-      Bypass.expect(bypass, "GET", "/storage/v1/b/bucket", fn conn ->
+      FakeServer.expect(fake, "GET", "/storage/v1/b/bucket", fn conn ->
         [auth] = Plug.Conn.get_req_header(conn, "authorization")
         send(test_pid, {:auth, auth})
 
@@ -327,9 +327,9 @@ defmodule GcpGcs.AuthTest do
     end
 
     test "a bad header value sent through the client never reaches the error" do
-      bypass = Bypass.open()
-      put_emulator_for_test(bypass.port)
-      url = "http://localhost:#{bypass.port}/storage/v1/b/bucket"
+      fake = FakeServer.open()
+      put_emulator_for_test(fake.port)
+      url = "http://localhost:#{fake.port}/storage/v1/b/bucket"
 
       assert {:error, %Error{} = error} =
                GcpGcs.Client.request(:get, url, headers: [{"x-secret", "s3cret\r\nx: y"}])

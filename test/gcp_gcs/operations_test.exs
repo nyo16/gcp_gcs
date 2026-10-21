@@ -1,27 +1,27 @@
 defmodule GcpGcs.OperationsTest do
   @moduledoc """
-  Public API error paths and request shapes against a local `Bypass` server:
+  Public API error paths and request shapes against a local fake HTTP server (`GcpGcs.FakeServer`):
   downloads, resumable-upload failures and object metadata operations.
 
-  `async: false` — the tests point the global emulator endpoint at Bypass.
+  `async: false` — the tests point the global emulator endpoint at the fake server.
   """
   use ExUnit.Case, async: false
 
   import GcpGcs.EnvHelper
 
-  alias GcpGcs.{Download, Error, FakeResumable}
+  alias GcpGcs.{Download, Error, FakeResumable, FakeServer}
 
   @bucket "test-bucket"
   @not_found ~s({"error":{"code":404,"message":"No such object: test-bucket/obj"}})
 
   setup do
-    bypass = Bypass.open()
-    put_emulator_for_test(bypass.port)
-    {:ok, bypass: bypass}
+    fake = FakeServer.open()
+    put_emulator_for_test(fake.port)
+    {:ok, fake: fake}
   end
 
-  defp expect_media_404(bypass) do
-    Bypass.expect_once(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+  defp expect_media_404(fake) do
+    FakeServer.expect_once(fake, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
       Plug.Conn.resp(conn, 404, @not_found)
     end)
   end
@@ -38,8 +38,8 @@ defmodule GcpGcs.OperationsTest do
   end
 
   describe "downloads" do
-    test "download/3 returns :not_found with the API message", %{bypass: bypass} do
-      expect_media_404(bypass)
+    test "download/3 returns :not_found with the API message", %{fake: fake} do
+      expect_media_404(fake)
 
       assert {:error, %Error{code: :not_found, message: "No such object: test-bucket/obj"}} =
                GcpGcs.download(@bucket, "obj")
@@ -47,10 +47,10 @@ defmodule GcpGcs.OperationsTest do
 
     @tag :tmp_dir
     test "download_to_file/4 leaves neither the file nor .part on error", %{
-      bypass: bypass,
+      fake: fake,
       tmp_dir: tmp_dir
     } do
-      expect_media_404(bypass)
+      expect_media_404(fake)
       path = Path.join(tmp_dir, "out.bin")
 
       assert {:error, %Error{code: :not_found}} = GcpGcs.download_to_file(@bucket, "obj", path)
@@ -70,8 +70,8 @@ defmodule GcpGcs.OperationsTest do
       assert File.ls!(dir) == []
     end
 
-    test "stream/5 returns the error and the reducer never sees data", %{bypass: bypass} do
-      expect_media_404(bypass)
+    test "stream/5 returns the error and the reducer never sees data", %{fake: fake} do
+      expect_media_404(fake)
       test_pid = self()
 
       reducer = fn
@@ -89,8 +89,8 @@ defmodule GcpGcs.OperationsTest do
       refute_received {:data, _}
     end
 
-    test "stream/5 folds every chunk of a chunked body", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+    test "stream/5 folds every chunk of a chunked body", %{fake: fake} do
+      FakeServer.expect_once(fake, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
         assert conn.query_string == "alt=media"
         conn = Plug.Conn.send_chunked(conn, 200)
 
@@ -109,10 +109,10 @@ defmodule GcpGcs.OperationsTest do
       assert IO.iodata_to_binary(iodata) == "one,two,three"
     end
 
-    test ":range sends a Range header and a 206 is a success", %{bypass: bypass} do
+    test ":range sends a Range header and a 206 is a success", %{fake: fake} do
       test_pid = self()
 
-      Bypass.expect(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+      FakeServer.expect(fake, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
         send(test_pid, {:range, Plug.Conn.get_req_header(conn, "range")})
         Plug.Conn.resp(conn, 206, "cde")
       end)
@@ -129,9 +129,9 @@ defmodule GcpGcs.OperationsTest do
       refute_received {:range, _}
     end
 
-    test "a reducer returning {:halt, acc} stops reading the body", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
-        Bypass.pass(bypass)
+    test "a reducer returning {:halt, acc} stops reading the body", %{fake: fake} do
+      FakeServer.expect_once(fake, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+        FakeServer.pass(fake)
         conn = Plug.Conn.send_chunked(conn, 200)
 
         Enum.reduce(["first", "second", "third"], conn, fn part, conn ->
@@ -150,9 +150,9 @@ defmodule GcpGcs.OperationsTest do
       assert {:ok, ["first"]} = GcpGcs.download_stream(@bucket, "obj", [], reducer)
     end
 
-    test "a large error body is truncated to 64 KiB", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
-        Bypass.pass(bypass)
+    test "a large error body is truncated to 64 KiB", %{fake: fake} do
+      FakeServer.expect_once(fake, "GET", "/storage/v1/b/#{@bucket}/o/obj", fn conn ->
+        FakeServer.pass(fake)
         Plug.Conn.resp(conn, 403, String.duplicate("x", 1024 * 1024))
       end)
 
@@ -164,8 +164,8 @@ defmodule GcpGcs.OperationsTest do
   end
 
   describe "resumable upload failures" do
-    test "an initiation 200 without Location is an error", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
+    test "an initiation 200 without Location is an error", %{fake: fake} do
+      FakeServer.expect_once(fake, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
         Plug.Conn.resp(conn, 200, "")
       end)
 
@@ -173,8 +173,8 @@ defmodule GcpGcs.OperationsTest do
                GcpGcs.start_resumable_upload(@bucket, "obj")
     end
 
-    test "an initiation 403 is :permission_denied", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
+    test "an initiation 403 is :permission_denied", %{fake: fake} do
+      FakeServer.expect_once(fake, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
         json(conn, 403, %{"error" => %{"code" => 403, "message" => "denied"}})
       end)
 
@@ -182,9 +182,9 @@ defmodule GcpGcs.OperationsTest do
                GcpGcs.upload_stream(@bucket, "obj", ["data"])
     end
 
-    test "with retries disabled, a failing chunk PUT stops the upload", %{bypass: bypass} do
+    test "with retries disabled, a failing chunk PUT stops the upload", %{fake: fake} do
       server =
-        FakeResumable.start(bypass, fn
+        FakeResumable.start(fake, fn
           1, _req -> {:status, 503}
           _i, _req -> :all
         end)
@@ -196,7 +196,7 @@ defmodule GcpGcs.OperationsTest do
                GcpGcs.upload_stream(@bucket, "obj", [data], chunk_size: chunk, retry: false)
 
       assert %{session_uri: session_uri} = details
-      assert session_uri == FakeResumable.session_uri(bypass)
+      assert session_uri == FakeResumable.session_uri(fake)
       assert length(FakeResumable.puts(server)) == 2
     end
 
@@ -207,13 +207,13 @@ defmodule GcpGcs.OperationsTest do
 
     @tag :tmp_dir
     test "upload_file/4 of an empty file is a single media upload", %{
-      bypass: bypass,
+      fake: fake,
       tmp_dir: tmp_dir
     } do
       path = Path.join(tmp_dir, "empty.txt")
       File.write!(path, "")
 
-      Bypass.expect_once(bypass, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
+      FakeServer.expect_once(fake, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
         assert %{"uploadType" => "media", "name" => "empty.txt"} =
                  URI.decode_query(conn.query_string)
 
@@ -225,10 +225,10 @@ defmodule GcpGcs.OperationsTest do
   end
 
   describe "rewrite_object/5" do
-    test "follows the rewrite token until done", %{bypass: bypass} do
+    test "follows the rewrite token until done", %{fake: fake} do
       test_pid = self()
 
-      Bypass.expect(bypass, "POST", "/storage/v1/b/src/o/a%2Fb/rewriteTo/b/dst/o/c", fn conn ->
+      FakeServer.expect(fake, "POST", "/storage/v1/b/src/o/a%2Fb/rewriteTo/b/dst/o/c", fn conn ->
         query = URI.decode_query(conn.query_string)
         send(test_pid, {:rewrite, query})
 
@@ -247,8 +247,8 @@ defmodule GcpGcs.OperationsTest do
       assert_received {:rewrite, %{"rewriteToken" => "t1"}}
     end
 
-    test "passes 4xx errors through", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "POST", "/storage/v1/b/src/o/a/rewriteTo/b/dst/o/c", fn conn ->
+    test "passes 4xx errors through", %{fake: fake} do
+      FakeServer.expect_once(fake, "POST", "/storage/v1/b/src/o/a/rewriteTo/b/dst/o/c", fn conn ->
         json(conn, 404, %{"error" => %{"message" => "gone"}})
       end)
 
@@ -256,8 +256,8 @@ defmodule GcpGcs.OperationsTest do
                GcpGcs.rewrite_object("src", "a", "dst", "c")
     end
 
-    test "an unexpected response shape is an error, not a success", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "POST", "/storage/v1/b/src/o/a/rewriteTo/b/dst/o/c", fn conn ->
+    test "an unexpected response shape is an error, not a success", %{fake: fake} do
+      FakeServer.expect_once(fake, "POST", "/storage/v1/b/src/o/a/rewriteTo/b/dst/o/c", fn conn ->
         json(conn, 200, %{"kind" => "storage#rewriteResponse"})
       end)
 
@@ -267,8 +267,8 @@ defmodule GcpGcs.OperationsTest do
   end
 
   describe "copy, move and update" do
-    test "copy_object/5 posts attrs to the encoded copyTo path", %{bypass: bypass} do
-      Bypass.expect_once(bypass, fn conn ->
+    test "copy_object/5 posts attrs to the encoded copyTo path", %{fake: fake} do
+      FakeServer.expect_once(fake, fn conn ->
         assert conn.method == "POST"
         assert conn.request_path == "/storage/v1/b/src/o/dir%2Fa.txt/copyTo/b/dst/o/dir%2Fb.txt"
         {body, conn} = read_json(conn)
@@ -282,8 +282,8 @@ defmodule GcpGcs.OperationsTest do
                )
     end
 
-    test "move_object/4 posts to the encoded moveTo path", %{bypass: bypass} do
-      Bypass.expect_once(bypass, fn conn ->
+    test "move_object/4 posts to the encoded moveTo path", %{fake: fake} do
+      FakeServer.expect_once(fake, fn conn ->
         assert conn.method == "POST"
         assert conn.request_path == "/storage/v1/b/#{@bucket}/o/a%2Fb/moveTo/o/c%2Fd"
         json(conn, 200, %{"name" => "c/d"})
@@ -292,8 +292,8 @@ defmodule GcpGcs.OperationsTest do
       assert {:ok, %{"name" => "c/d"}} = GcpGcs.move_object(@bucket, "a/b", "c/d")
     end
 
-    test "update_object/4 patches the encoded object path", %{bypass: bypass} do
-      Bypass.expect_once(bypass, fn conn ->
+    test "update_object/4 patches the encoded object path", %{fake: fake} do
+      FakeServer.expect_once(fake, fn conn ->
         assert conn.method == "PATCH"
         assert conn.request_path == "/storage/v1/b/#{@bucket}/o/a%2Fb"
         {body, conn} = read_json(conn)
@@ -305,8 +305,8 @@ defmodule GcpGcs.OperationsTest do
                GcpGcs.update_object(@bucket, "a/b", %{"metadata" => %{"k" => "v"}})
     end
 
-    test "404s pass through", %{bypass: bypass} do
-      Bypass.expect(bypass, fn conn -> json(conn, 404, %{"error" => %{"message" => "nope"}}) end)
+    test "404s pass through", %{fake: fake} do
+      FakeServer.expect(fake, fn conn -> json(conn, 404, %{"error" => %{"message" => "nope"}}) end)
 
       for result <- [
             GcpGcs.copy_object("src", "a", "dst", "b"),

@@ -1,23 +1,23 @@
 defmodule GcpGcs.UploadResumableTest do
   @moduledoc """
-  Resumable-upload chunking against a Bypass-backed fake session
+  Resumable-upload chunking against a fake session on `GcpGcs.FakeServer`
   (`GcpGcs.FakeResumable`), asserting what goes over the wire.
 
-  `async: false` — the tests point the global emulator endpoint at Bypass.
+  `async: false` — the tests point the global emulator endpoint at the fake server.
   """
   use ExUnit.Case, async: false
 
   import GcpGcs.EnvHelper
 
-  alias GcpGcs.{Error, FakeResumable, Upload}
+  alias GcpGcs.{Error, FakeResumable, FakeServer, Upload}
 
   @bucket "test-bucket"
   @chunk 262_144
 
   setup do
-    bypass = Bypass.open()
-    put_emulator_for_test(bypass.port)
-    {:ok, bypass: bypass}
+    fake = FakeServer.open()
+    put_emulator_for_test(fake.port)
+    {:ok, fake: fake}
   end
 
   defp input(size), do: :crypto.strong_rand_bytes(size)
@@ -32,10 +32,10 @@ defmodule GcpGcs.UploadResumableTest do
 
   describe "upload_stream/4 partial persistence" do
     test "a 308 persisting only part of a chunk resends from the persisted offset", %{
-      bypass: bypass
+      fake: fake
     } do
       server =
-        FakeResumable.start(bypass, fn
+        FakeResumable.start(fake, fn
           0, _req -> {:partial, 100}
           _i, _req -> :all
         end)
@@ -53,9 +53,9 @@ defmodule GcpGcs.UploadResumableTest do
       assert FakeResumable.data(server) == data
     end
 
-    test "a 308 without Range on the first chunk resends the whole chunk", %{bypass: bypass} do
+    test "a 308 without Range on the first chunk resends the whole chunk", %{fake: fake} do
       server =
-        FakeResumable.start(bypass, fn
+        FakeResumable.start(fake, fn
           0, _req -> :none
           _i, _req -> :all
         end)
@@ -72,8 +72,8 @@ defmodule GcpGcs.UploadResumableTest do
       assert FakeResumable.data(server) == data
     end
 
-    test "a 308 without Range after the first chunk is data loss", %{bypass: bypass} do
-      FakeResumable.start(bypass, fn
+    test "a 308 without Range after the first chunk is data loss", %{fake: fake} do
+      FakeResumable.start(fake, fn
         1, _req -> :forget
         _i, _req -> :all
       end)
@@ -84,8 +84,8 @@ defmodule GcpGcs.UploadResumableTest do
                )
     end
 
-    test "repeated no-progress 308s stop with an error instead of looping", %{bypass: bypass} do
-      server = FakeResumable.start(bypass, fn _i, _req -> :none end)
+    test "repeated no-progress 308s stop with an error instead of looping", %{fake: fake} do
+      server = FakeResumable.start(fake, fn _i, _req -> :none end)
 
       assert {:error, %Error{message: "resumable upload made no progress" <> _}} =
                Upload.upload_stream(@bucket, "object.bin", [input(@chunk)], chunk_size: @chunk)
@@ -95,9 +95,9 @@ defmodule GcpGcs.UploadResumableTest do
   end
 
   describe "upload_stream/4 finalize" do
-    test "a 308 on the final request resends the unsent tail", %{bypass: bypass} do
+    test "a 308 on the final request resends the unsent tail", %{fake: fake} do
       server =
-        FakeResumable.start(bypass, fn
+        FakeResumable.start(fake, fn
           0, _req -> {:partial, 40}
           _i, _req -> :all
         end)
@@ -117,15 +117,15 @@ defmodule GcpGcs.UploadResumableTest do
   describe "resume after a transient failure" do
     # PUT 0: chunk 1 persisted; PUT 1: chunk 2 fails with 503; PUT 2: the
     # status query (reports bytes=0-262143); then the upload continues.
-    defp failing_second_put(bypass) do
-      FakeResumable.start(bypass, fn
+    defp failing_second_put(fake) do
+      FakeResumable.start(fake, fn
         1, _req -> {:status, 503}
         _i, _req -> :all
       end)
     end
 
-    test "upload_stream/4 queries the status and resends the held chunk", %{bypass: bypass} do
-      server = failing_second_put(bypass)
+    test "upload_stream/4 queries the status and resends the held chunk", %{fake: fake} do
+      server = failing_second_put(fake)
       data = input(3 * @chunk + 7)
 
       assert {:ok, _} =
@@ -141,10 +141,10 @@ defmodule GcpGcs.UploadResumableTest do
 
     @tag :tmp_dir
     test "upload_file/4 sends chunks and resumes from the persisted offset", %{
-      bypass: bypass,
+      fake: fake,
       tmp_dir: tmp_dir
     } do
-      server = failing_second_put(bypass)
+      server = failing_second_put(fake)
       data = input(3 * @chunk + 7)
       path = Path.join(tmp_dir, "payload.bin")
       File.write!(path, data)
@@ -163,8 +163,8 @@ defmodule GcpGcs.UploadResumableTest do
       assert FakeResumable.data(server) == data
     end
 
-    test "with retries disabled the error carries the session URI", %{bypass: bypass} do
-      failing_second_put(bypass)
+    test "with retries disabled the error carries the session URI", %{fake: fake} do
+      failing_second_put(fake)
 
       assert {:error, %Error{code: :unavailable, details: %{session_uri: uri, cause: _}}} =
                Upload.upload_stream(@bucket, "object.bin", [input(3 * @chunk)],
@@ -172,13 +172,13 @@ defmodule GcpGcs.UploadResumableTest do
                  retry: false
                )
 
-      assert uri == FakeResumable.session_uri(bypass)
+      assert uri == FakeResumable.session_uri(fake)
     end
   end
 
   describe "integrity hash" do
-    test "the final request carries the MD5 of the whole object", %{bypass: bypass} do
-      server = FakeResumable.start(bypass)
+    test "the final request carries the MD5 of the whole object", %{fake: fake} do
+      server = FakeResumable.start(fake)
       data = input(2 * @chunk + 5)
 
       assert {:ok, _} =
@@ -191,9 +191,9 @@ defmodule GcpGcs.UploadResumableTest do
       assert {"x-goog-hash", md5} in final.headers
     end
 
-    test "resent bytes are hashed once", %{bypass: bypass} do
+    test "resent bytes are hashed once", %{fake: fake} do
       server =
-        FakeResumable.start(bypass, fn
+        FakeResumable.start(fake, fn
           0, _req -> {:partial, 100}
           _i, _req -> :all
         end)
@@ -206,8 +206,8 @@ defmodule GcpGcs.UploadResumableTest do
       assert {"x-goog-hash", "md5=" <> Base.encode64(:crypto.hash(:md5, data))} in final.headers
     end
 
-    test "checksum: false sends no hash", %{bypass: bypass} do
-      server = FakeResumable.start(bypass)
+    test "checksum: false sends no hash", %{fake: fake} do
+      server = FakeResumable.start(fake)
 
       assert {:ok, _} =
                Upload.upload_stream(@bucket, "object.bin", ["abc"], checksum: false)
@@ -220,8 +220,8 @@ defmodule GcpGcs.UploadResumableTest do
   describe ":attrs on in-memory and empty uploads" do
     @attrs %{"metadata" => %{"k" => "v"}, "cacheControl" => "no-cache"}
 
-    test "put_object/4 with :attrs uses a session and one PUT", %{bypass: bypass} do
-      server = FakeResumable.start(bypass)
+    test "put_object/4 with :attrs uses a session and one PUT", %{fake: fake} do
+      server = FakeResumable.start(fake)
 
       assert {:ok, _} = GcpGcs.put_object(@bucket, "object.bin", "data", attrs: @attrs)
 
@@ -234,10 +234,10 @@ defmodule GcpGcs.UploadResumableTest do
 
     @tag :tmp_dir
     test "an empty file with :attrs or :origin finalizes with bytes */0", %{
-      bypass: bypass,
+      fake: fake,
       tmp_dir: tmp_dir
     } do
-      server = FakeResumable.start(bypass)
+      server = FakeResumable.start(fake)
       path = Path.join(tmp_dir, "empty.bin")
       File.write!(path, "")
 
@@ -257,11 +257,11 @@ defmodule GcpGcs.UploadResumableTest do
 
   describe "upload_chunk/3 session URI validation" do
     # `other` has no expectations: any request reaching it fails the test.
-    setup %{bypass: bypass} do
+    setup %{fake: fake} do
       {:ok,
-       other: Bypass.open(),
+       other: FakeServer.open(),
        path: "/upload/storage/v1/b/#{@bucket}/o?upload_id=x",
-       port: bypass.port}
+       port: fake.port}
     end
 
     test "rejects a foreign host", %{other: other, path: path} do
@@ -293,8 +293,8 @@ defmodule GcpGcs.UploadResumableTest do
                Upload.upload_chunk(uri, "data", offset: 0, total: 4)
     end
 
-    test "rejects a server-returned Location on another host", %{bypass: bypass, other: other} do
-      Bypass.expect_once(bypass, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
+    test "rejects a server-returned Location on another host", %{fake: fake, other: other} do
+      FakeServer.expect_once(fake, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
         conn
         |> Plug.Conn.put_resp_header(
           "location",

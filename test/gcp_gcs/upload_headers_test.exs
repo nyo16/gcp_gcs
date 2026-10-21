@@ -13,32 +13,32 @@ defmodule GcpGcs.UploadHeadersTest do
       the response, failing the upload client-side.
 
   The emulator enforces neither, so these assertions run against a local
-  `Bypass` server that captures the exact headers sent.
+  fake HTTP server (`GcpGcs.FakeServer`) that captures the exact headers sent.
 
-  `async: false` — the tests point the global emulator endpoint at Bypass.
+  `async: false` — the tests point the global emulator endpoint at the fake server.
   """
   use ExUnit.Case, async: false
 
   import GcpGcs.EnvHelper
 
-  alias GcpGcs.Upload
+  alias GcpGcs.{FakeServer, Upload}
 
   @bucket "test-bucket"
 
   setup do
-    bypass = Bypass.open()
-    put_emulator_for_test(bypass.port)
-    {:ok, bypass: bypass}
+    fake = FakeServer.open()
+    put_emulator_for_test(fake.port)
+    {:ok, fake: fake}
   end
 
-  test "session-initiation POST sends Content-Length: 0 when it has no body", %{bypass: bypass} do
+  test "session-initiation POST sends Content-Length: 0 when it has no body", %{fake: fake} do
     test_pid = self()
 
-    Bypass.expect_once(bypass, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
+    FakeServer.expect_once(fake, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
       send(test_pid, {:req_headers, conn.req_headers})
 
       conn
-      |> Plug.Conn.put_resp_header("location", session_uri(bypass))
+      |> Plug.Conn.put_resp_header("location", session_uri(fake))
       |> Plug.Conn.resp(200, "")
     end)
 
@@ -48,14 +48,14 @@ defmodule GcpGcs.UploadHeadersTest do
     assert {"content-length", "0"} in headers
   end
 
-  test "session-initiation POST forwards :origin as the Origin header", %{bypass: bypass} do
+  test "session-initiation POST forwards :origin as the Origin header", %{fake: fake} do
     test_pid = self()
 
-    Bypass.expect_once(bypass, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
+    FakeServer.expect_once(fake, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
       send(test_pid, {:req_headers, conn.req_headers})
 
       conn
-      |> Plug.Conn.put_resp_header("location", session_uri(bypass))
+      |> Plug.Conn.put_resp_header("location", session_uri(fake))
       |> Plug.Conn.resp(200, "")
     end)
 
@@ -68,14 +68,14 @@ defmodule GcpGcs.UploadHeadersTest do
     assert {"origin", "https://app.example.com"} in headers
   end
 
-  test "session-initiation POST sends no Origin header when :origin is absent", %{bypass: bypass} do
+  test "session-initiation POST sends no Origin header when :origin is absent", %{fake: fake} do
     test_pid = self()
 
-    Bypass.expect_once(bypass, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
+    FakeServer.expect_once(fake, "POST", "/upload/storage/v1/b/#{@bucket}/o", fn conn ->
       send(test_pid, {:req_headers, conn.req_headers})
 
       conn
-      |> Plug.Conn.put_resp_header("location", session_uri(bypass))
+      |> Plug.Conn.put_resp_header("location", session_uri(fake))
       |> Plug.Conn.resp(200, "")
     end)
 
@@ -87,7 +87,7 @@ defmodule GcpGcs.UploadHeadersTest do
 
   @tag :tmp_dir
   test "session PUT sends Content-Length and never transfer-encoding: chunked", %{
-    bypass: bypass,
+    fake: fake,
     tmp_dir: tmp_dir
   } do
     test_pid = self()
@@ -96,11 +96,11 @@ defmodule GcpGcs.UploadHeadersTest do
     path = Path.join(tmp_dir, "payload.bin")
     File.write!(path, payload)
 
-    Bypass.expect(bypass, fn conn ->
+    FakeServer.expect(fake, fn conn ->
       case conn.method do
         "POST" ->
           conn
-          |> Plug.Conn.put_resp_header("location", session_uri(bypass))
+          |> Plug.Conn.put_resp_header("location", session_uri(fake))
           |> Plug.Conn.resp(200, "")
 
         "PUT" ->
@@ -116,6 +116,6 @@ defmodule GcpGcs.UploadHeadersTest do
     assert List.keyfind(headers, "transfer-encoding", 0) == nil
   end
 
-  defp session_uri(bypass),
-    do: "http://localhost:#{bypass.port}/upload/storage/v1/b/#{@bucket}/o?upload_id=abc123"
+  defp session_uri(fake),
+    do: "http://localhost:#{fake.port}/upload/storage/v1/b/#{@bucket}/o?upload_id=abc123"
 end

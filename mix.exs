@@ -79,7 +79,8 @@ defmodule GcpGcs.MixProject do
       {:finch, "~> 0.24"},
       {:telemetry, "~> 1.0"},
       {:goth, "~> 1.4", optional: true},
-      {:bypass, "~> 2.1", only: :test},
+      # Local HTTP server for tests (test/support/fake_server.ex).
+      {:bandit, "~> 1.6", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

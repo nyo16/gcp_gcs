@@ -1,15 +1,17 @@
 defmodule GcpGcsTest do
-  # Not async: points the global emulator endpoint at a downed Bypass server.
+  # Not async: points the global emulator endpoint at a downed fake server.
   use ExUnit.Case, async: false
 
   import GcpGcs.EnvHelper
 
+  alias GcpGcs.FakeServer
+
   # The endpoint refuses connections, so an input that slipped past validation
   # would surface as :connection_error instead of :validation_error.
   setup do
-    bypass = Bypass.open()
-    Bypass.down(bypass)
-    put_emulator_for_test(bypass.port)
+    fake = FakeServer.open()
+    FakeServer.down(fake)
+    put_emulator_for_test(fake.port)
   end
 
   describe "validation short-circuits before any network call" do
@@ -100,10 +102,10 @@ defmodule GcpGcsTest do
     import ExUnit.CaptureIO
 
     setup do
-      bypass = Bypass.open()
-      put_emulator_for_test(bypass.port)
+      fake = FakeServer.open()
+      put_emulator_for_test(fake.port)
 
-      Bypass.expect(bypass, "GET", "/storage/v1/b/valid-bucket/o/obj", fn conn ->
+      FakeServer.expect(fake, "GET", "/storage/v1/b/valid-bucket/o/obj", fn conn ->
         Plug.Conn.resp(conn, 200, "body")
       end)
 

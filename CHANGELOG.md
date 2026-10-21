@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (development)
+- The test suite's local HTTP server is now `GcpGcs.FakeServer` (Bandit plus a
+  dispatching Plug) instead of the unmaintained Bypass, which removes
+  plug_cowboy/cowboy/cowlib/ranch from the test dependencies (and with them
+  cowlib CVE-2026-43966).
+
 ## [0.3.0] - 2026-10-20
 
 ### Breaking

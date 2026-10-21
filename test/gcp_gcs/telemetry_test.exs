@@ -54,12 +54,12 @@ defmodule GcpGcs.TelemetryTest do
   describe "operation names and metadata" do
     import GcpGcs.EnvHelper
 
-    alias GcpGcs.FakeResumable
+    alias GcpGcs.{FakeResumable, FakeServer}
 
     setup do
-      bypass = Bypass.open()
-      put_emulator_for_test(bypass.port)
-      {:ok, bypass: bypass}
+      fake = FakeServer.open()
+      put_emulator_for_test(fake.port)
+      {:ok, fake: fake}
     end
 
     defp stops do
@@ -72,10 +72,10 @@ defmodule GcpGcs.TelemetryTest do
 
     @tag :tmp_dir
     test "uploads and downloads report their own operation", %{
-      bypass: bypass,
+      fake: fake,
       tmp_dir: tmp_dir
     } do
-      server = FakeResumable.start(bypass)
+      server = FakeResumable.start(fake)
       path = Path.join(tmp_dir, "f.bin")
       File.write!(path, "abc")
       bucket = "test-bucket"
@@ -96,7 +96,7 @@ defmodule GcpGcs.TelemetryTest do
 
       dest = Path.join(tmp_dir, "out.bin")
 
-      Bypass.expect(bypass, "GET", "/storage/v1/b/#{bucket}/o/x", fn conn ->
+      FakeServer.expect(fake, "GET", "/storage/v1/b/#{bucket}/o/x", fn conn ->
         Plug.Conn.resp(conn, 200, "x")
       end)
 
