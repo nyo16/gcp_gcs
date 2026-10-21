@@ -37,6 +37,10 @@ defmodule GcpGcs.ValidationTest do
       assert {:error, %Error{}} = Validation.validate_bucket(".bucket")
     end
 
+    test "rejects a trailing newline" do
+      assert {:error, %Error{}} = Validation.validate_bucket("bucket\n")
+    end
+
     test "rejects IP addresses" do
       assert {:error, %Error{}} = Validation.validate_bucket("192.168.0.1")
     end
@@ -104,4 +108,85 @@ defmodule GcpGcs.ValidationTest do
       assert {:error, %Error{}} = Validation.validate_binary(123, "data")
     end
   end
+
+  # The matchers are hand-written binary matching; these compare them with
+  # the grammar they implement, written as anchored regexes, over every
+  # string up to a few characters from alphabets of the boundary characters.
+  describe "agrees with the reference grammar" do
+    @bucket_grammar ~r/\A[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]\z/
+    @ip_grammar ~r/\A\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\z/
+
+    test "bucket names, including IP-shaped ones" do
+      candidates =
+        strings(~c"a0._-A\n", 0..5) ++
+          strings(~c"19.", 7..9) ++
+          [
+            String.duplicate("a", 63),
+            String.duplicate("a", 64),
+            "a" <> String.duplicate("_", 61) <> "a"
+          ]
+
+      for name <- candidates do
+        expected =
+          cond do
+            not Regex.match?(@bucket_grammar, name) -> :bad_name
+            Regex.match?(@ip_grammar, name) -> :ip
+            true -> :other
+          end
+
+        actual =
+          case Validation.validate_bucket(name) do
+            {:error, %Error{message: "bucket must be 3-63" <> _}} -> :bad_name
+            {:error, %Error{message: "bucket must not be an IP address"}} -> :ip
+            _ -> :other
+          end
+
+        assert actual == expected, "bucket #{inspect(name)}: #{actual}, expected #{expected}"
+      end
+    end
+
+    test "control characters in object names" do
+      for name <- strings([?a, 0x00, 0x1F, 0x20, 0x7F], 1..4), name not in [".", ".."] do
+        control? = Regex.match?(~r/[\x00-\x1F]/, name)
+
+        assert match?(
+                 {:error, %Error{message: "object name must not contain control" <> _}},
+                 Validation.validate_object(name)
+               ) ==
+                 control?,
+               "object #{inspect(name)}"
+      end
+    end
+
+    test "header values" do
+      for value <- strings([?a, ?\s, 0x1F, 0x7E, 0x7F, ?\n], 0..4) do
+        assert match?({:ok, _}, Validation.validate_header_value(value, ":origin")) ==
+                 Regex.match?(~r/\A[\x20-\x7E]+\z/, value),
+               "header value #{inspect(value)}"
+      end
+    end
+
+    test "the persisted range of a 308" do
+      for prefix <- ["bytes=0-", "0-", " bytes=0-", "bytes=1-", "BYTES=0-"],
+          suffix <- strings(~c"09+- x\n", 0..3) do
+        value = prefix <> suffix
+
+        expected =
+          case Regex.run(~r/\A(?:bytes=)?0-(\d+)\z/, String.trim(value)) do
+            [_, last] -> {:ok, String.to_integer(last) + 1}
+            nil -> :error
+          end
+
+        assert GcpGcs.Upload.next_offset([{"range", value}]) == expected,
+               "range #{inspect(value)}"
+      end
+    end
+  end
+
+  # Every string over `alphabet` whose length is in `lengths`.
+  defp strings(alphabet, lengths) do
+    Enum.flat_map(lengths, fn n -> Enum.reduce(1..n//1, [""], &extend(&2, alphabet, &1)) end)
+  end
+
+  defp extend(prefixes, alphabet, _step), do: for(s <- prefixes, c <- alphabet, do: s <> <<c>>)
 end

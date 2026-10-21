@@ -1,7 +1,7 @@
 defmodule GcpGcs.MixProject do
   use Mix.Project
 
-  @version "0.2.1"
+  @version "0.3.0"
   @source_url "https://github.com/nyo16/gcp_gcs"
 
   def project do
@@ -15,7 +15,9 @@ defmodule GcpGcs.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       dialyzer: [
         plt_local_path: "priv/plts",
-        plt_core_path: "priv/plts"
+        plt_core_path: "priv/plts",
+        # CI runs dialyzer with MIX_ENV=test, which compiles test/support (ExUnit).
+        plt_add_apps: [:ex_unit]
       ],
 
       # Docs
@@ -28,7 +30,8 @@ defmodule GcpGcs.MixProject do
         source_ref: "v#{@version}",
         groups_for_modules: [
           Core: [GcpGcs, GcpGcs.Bucket, GcpGcs.Object, GcpGcs.Upload, GcpGcs.Download],
-          Infrastructure: [GcpGcs.Auth, GcpGcs.Client, GcpGcs.Config, GcpGcs.Error]
+          Infrastructure: [GcpGcs.Auth, GcpGcs.Config, GcpGcs.Error],
+          Observability: [GcpGcs.Telemetry]
         ]
       ],
       package: package()
@@ -73,14 +76,18 @@ defmodule GcpGcs.MixProject do
 
   defp deps do
     [
-      {:finch, "~> 0.19"},
+      # >= 0.24: pulls Mint CVE fixes and Finch PR #397 (pool checkout timeout
+      # no longer crashes with CaseClauseError under mint 1.11).
+      {:finch, "~> 0.24"},
       {:telemetry, "~> 1.0"},
       {:goth, "~> 1.4", optional: true},
-      {:bypass, "~> 2.1", only: :test},
+      # Local HTTP server for tests (test/support/fake_server.ex).
+      {:bandit, "~> 1.6", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false}
     ]
   end
 end

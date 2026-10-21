@@ -1,22 +1,41 @@
 defmodule GcpGcs.Client do
-  @moduledoc """
-  HTTP transport for the Google Cloud Storage JSON API.
-
-  Wraps `Finch` and handles authentication, query/body encoding, JSON
-  decoding, response streaming, and error normalization. Most users should
-  use the high-level `GcpGcs` API instead of calling this module directly.
-
-  Three entry points:
-
-    * `request/3` — JSON metadata operations (decodes the body, success = 2xx)
-    * `raw_request/3` — returns the raw response for any status (used by
-      resumable uploads, which rely on `308 Resume Incomplete`)
-    * `stream/5` — streams the response body through a reducer (used by downloads)
-  """
+  @moduledoc false
+  # HTTP transport for the Google Cloud Storage JSON API (internal).
+  #
+  # Wraps Finch and handles URL building, authentication, query/body encoding,
+  # JSON decoding, response streaming, retries, and error normalization.
+  #
+  # Three entry points, sharing one response-interpretation path:
+  #
+  #   * request/3 — JSON operations; success is any 2xx, returns the decoded body
+  #   * exchange/3 — success is any status listed in :expect (e.g. 308 for
+  #     resumable uploads); returns status, headers and the decoded body
+  #   * stream/5 — streams the response body through a reducer (downloads)
+  #
+  # `path` is either relative to the API root ("/b/bucket/o", resolved against
+  # the JSON or upload API with `api: :json | :upload`) or an absolute URL (a
+  # resumable session URI).
+  #
+  # Retries: idempotent requests (GET and HEAD, or any request marked
+  # `idempotent: true`) are retried on 408, 429, 500, 502, 503 and 504
+  # responses and on closed, timed-out or refused connections, with
+  # exponential backoff and full jitter, honouring Retry-After. Streams are
+  # retried only while the reducer has not been called. A 401 to a request
+  # that carried a bearer token is retried once with a token other than the
+  # rejected one (see GcpGcs.Auth.request_headers/2).
 
   alias GcpGcs.{Auth, Config, Error}
 
   @json_content_type "application/json; charset=UTF-8"
+
+  # Options domain modules forward from the caller to the transport.
+  @transport_opts [:timeout, :pool_timeout, :request_timeout, :finch, :base_url, :goth, :retry]
+
+  @retry_statuses [408, 429, 500, 502, 503, 504]
+  @retry_transport_reasons [:closed, :timeout, :econnrefused]
+
+  # Non-2xx stream bodies are buffered for the error; cap what we keep.
+  @max_error_body 64 * 1024
 
   @type method :: :get | :post | :put | :patch | :delete | :head
   @type body ::
@@ -24,91 +43,181 @@ defmodule GcpGcs.Client do
           | {:json, term()}
           | {:binary, binary(), String.t()}
           | {:stream, Enumerable.t(), String.t()}
+  @type headers :: [{String.t(), String.t()}]
 
   @doc """
-  Performs a JSON request and decodes the response body.
+  Performs a request and decodes the response body.
 
   ## Options
-  - `:query` — keyword list or map appended as the query string
+  - `:api` — `:json` (default) or `:upload`; which API root a relative path
+    is resolved against
+  - `:query` — keyword list or map appended as the query string (`nil`
+    values are dropped)
   - `:headers` — extra request headers (list of `{name, value}`)
   - `:body` — request body, see `t:body/0` (default `nil`)
   - `:auth` — set `false` to skip authentication (default `true`)
+  - `:idempotent` — `true` allows retrying a non-GET/HEAD request
   - `:timeout` — receive timeout in ms (default `GcpGcs.Config.default_timeout/0`)
+  - `:request_timeout` — overall deadline in ms (default: `:timeout`)
+  - `:pool_timeout` — max wait in ms for a pooled connection (default
+    `GcpGcs.Config.pool_timeout/0`); exceeding it returns
+    `{:error, %GcpGcs.Error{code: :resource_exhausted}}`
+  - `:finch` — Finch instance name (default `GcpGcs.Config.finch_name/0`)
+  - `:base_url` — API host, e.g. `"https://storage.googleapis.com"`
+    (default: the configured endpoint); never implies emulator mode
+  - `:goth` — Goth instance name for this request
+  - `:retry` — `false`, or a keyword list overriding `GcpGcs.Config.retry/0`
 
   Returns `{:ok, decoded}` on a 2xx response (`%{}` when the body is empty),
   or `{:error, %GcpGcs.Error{}}`.
   """
   @spec request(method(), String.t(), keyword()) :: {:ok, term()} | {:error, Error.t()}
-  def request(method, url, opts \\ []) do
-    with {:ok, response} <- raw_request(method, url, opts) do
-      interpret_json(response)
+  def request(method, path, opts \\ []) do
+    with {:ok, _status, _headers, body} <- exchange(method, path, opts) do
+      {:ok, body}
     end
   end
 
   @doc """
-  Performs a request and returns the raw `%Finch.Response{}` for any HTTP status.
+  Performs a request and accepts the statuses listed in `:expect` (default:
+  any 2xx) as success.
 
-  Only transport and authentication failures produce `{:error, _}`; HTTP
-  statuses (including `4xx` and `308`) are returned as `{:ok, response}` so the
-  caller can interpret them (e.g. resumable upload chunking).
+  Takes the options of `request/3` plus `:expect`. Returns
+  `{:ok, status, headers, decoded_body}`; any other status becomes
+  `{:error, %GcpGcs.Error{}}`, as do transport and authentication failures.
   """
-  @spec raw_request(method(), String.t(), keyword()) ::
-          {:ok, Finch.Response.t()} | {:error, Error.t()}
-  def raw_request(method, url, opts \\ []) do
-    with {:ok, auth_headers} <- auth_headers(opts),
-         {body_iodata, body_headers} <- encode_body(Keyword.get(opts, :body)) do
-      headers = auth_headers ++ body_headers ++ Keyword.get(opts, :headers, [])
-      full_url = append_query(url, Keyword.get(opts, :query))
-      # `|| default` (not Keyword.get/3 default) so an explicit `timeout: nil`
-      # from callers still resolves to the default rather than reaching Finch.
-      timeout = Keyword.get(opts, :timeout) || Config.default_timeout()
+  @spec exchange(method(), String.t(), keyword()) ::
+          {:ok, non_neg_integer(), headers(), term()} | {:error, Error.t()}
+  def exchange(method, path, opts \\ []) do
+    url = url(path, opts)
+    outcome = with_retries(method, opts, &exchange_attempt(method, url, opts, &1))
 
-      method
-      |> Finch.build(full_url, headers, body_iodata)
-      |> Finch.request(Config.finch_name(), receive_timeout: timeout)
-      |> case do
-        {:ok, %Finch.Response{} = response} -> {:ok, response}
-        {:error, reason} -> {:error, Error.from_transport(reason)}
-      end
+    case outcome do
+      {:response, status, headers, body} ->
+        if expected?(status, Keyword.get(opts, :expect)),
+          do: {:ok, status, headers, decode_body(body)},
+          else: {:error, Error.from_response(status, decode_body(body))}
+
+      {:transport_error, reason, _touched?} ->
+        {:error, Error.from_transport(reason)}
+
+      {:error, %Error{}} = error ->
+        error
     end
   end
 
   @doc """
   Streams a response body through `reducer`, starting from `acc`.
 
-  `reducer` receives `{:status, integer}`, `{:headers, headers}`, and
-  `{:data, binary}` chunks (as `Finch.stream/5`). On a non-2xx status the body
-  is collected and returned as `{:error, %GcpGcs.Error{}}` instead.
+  `reducer` receives `{:headers, headers}` and `{:data, binary}` chunks and
+  returns the new accumulator, `{:cont, acc}`, or `{:halt, acc}` to stop
+  reading the body. (A plain accumulator that is itself a `{:cont, _}` or
+  `{:halt, _}` tuple is read as that instruction.) On a non-2xx status the
+  reducer is not called; up to 64 KiB of the body is collected and returned as
+  `{:error, %GcpGcs.Error{}}` instead.
 
+  Takes the options of `request/3` except `:body` and `:request_timeout`.
   Returns `{:ok, {status, headers, acc}}` on success.
   """
-  @spec stream(method(), String.t(), keyword(), acc, (term(), acc -> acc)) ::
-          {:ok, {non_neg_integer(), list(), acc}} | {:error, Error.t()}
+  @spec stream(method(), String.t(), keyword(), acc, (term(), acc -> term())) ::
+          {:ok, {non_neg_integer(), headers(), acc}} | {:error, Error.t()}
         when acc: term()
-  def stream(method, url, opts, acc, reducer) when is_function(reducer, 2) do
-    with {:ok, auth_headers} <- auth_headers(opts) do
-      headers = auth_headers ++ Keyword.get(opts, :headers, [])
-      full_url = append_query(url, Keyword.get(opts, :query))
-      # `|| default` (not Keyword.get/3 default) so an explicit `timeout: nil`
-      # from callers still resolves to the default rather than reaching Finch.
-      timeout = Keyword.get(opts, :timeout) || Config.default_timeout()
+  def stream(method, path, opts, acc, reducer) when is_function(reducer, 2) do
+    url = url(path, opts)
 
-      # Track status so we can divert the body into an error buffer on failure.
-      init = {:status, nil, [], acc, []}
+    outcome = with_retries(method, opts, &stream_attempt(method, url, opts, acc, reducer, &1))
 
-      request = Finch.build(method, full_url, headers)
+    case outcome do
+      {:response, status, headers, user_acc} when status in 200..299 ->
+        {:ok, {status, headers, user_acc}}
 
-      case Finch.stream(request, Config.finch_name(), init, &stream_step(&1, &2, reducer),
-             receive_timeout: timeout
-           ) do
-        {:ok, {_, status, resp_headers, user_acc, err_buf}} ->
-          finish_stream(status, resp_headers, user_acc, err_buf)
+      {:response, status, _headers, body} ->
+        {:error, Error.from_response(status, decode_body(body))}
 
-        {:error, reason, _partial_acc} ->
-          {:error, Error.from_transport(reason)}
-      end
+      {:transport_error, reason, _touched?} ->
+        {:error, Error.from_transport(reason)}
+
+      {:error, %Error{}} = error ->
+        error
     end
   end
+
+  # One attempt of exchange/3, as a retry outcome (see with_retries/3).
+  defp exchange_attempt(method, url, opts, stale_token) do
+    with {:ok, auth_headers} <- auth_headers(opts, stale_token) do
+      {body_iodata, body_headers} = encode_body(Keyword.get(opts, :body))
+      headers = auth_headers ++ body_headers ++ Keyword.get(opts, :headers, [])
+      request = Finch.build(method, url, headers, body_iodata)
+
+      request
+      |> checkout_safe(&Finch.request(&1, finch(opts), request_opts(opts)))
+      |> exchange_outcome()
+      |> tag_unauthorized(auth_headers)
+    end
+  end
+
+  defp exchange_outcome({:ok, %Finch.Response{status: status, headers: headers, body: body}}),
+    do: {:response, status, headers, body}
+
+  defp exchange_outcome({:error, %Error{}} = error), do: error
+  defp exchange_outcome({:error, reason}), do: {:transport_error, reason, false}
+
+  # One attempt of stream/5, as a retry outcome. The payload of a 2xx is the
+  # user accumulator, otherwise the (capped) error body.
+  defp stream_attempt(method, url, opts, acc, reducer, stale_token) do
+    with {:ok, auth_headers} <- auth_headers(opts, stale_token) do
+      request = Finch.build(method, url, auth_headers ++ Keyword.get(opts, :headers, []))
+      # {phase, status, headers, user_acc, {error_chunks, error_bytes}}
+      init = {:status, nil, [], acc, {[], 0}}
+      step = &stream_step(&1, &2, reducer)
+
+      request
+      |> checkout_safe(&Finch.stream_while(&1, finch(opts), init, step, stream_opts(opts)))
+      |> stream_outcome()
+      |> tag_unauthorized(auth_headers)
+    end
+  end
+
+  defp stream_outcome({:ok, {:ok, status, headers, user_acc, _err}}),
+    do: {:response, status, headers, user_acc}
+
+  defp stream_outcome({:ok, {_phase, status, headers, _user_acc, {chunks, _size}}}),
+    do: {:response, status, headers, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+
+  defp stream_outcome({:error, %Error{}} = error), do: error
+
+  defp stream_outcome({:error, reason, {phase, _, _, _, _}}),
+    do: {:transport_error, reason, phase == :ok}
+
+  # A 401 to a request that carried a bearer token: retry_loop/4 retries once,
+  # telling the auth layer which token was rejected.
+  defp tag_unauthorized({:response, 401, _headers, _payload} = outcome, auth_headers) do
+    case List.keyfind(auth_headers, "authorization", 0) do
+      {_, sent_token} -> {:unauthorized, sent_token, outcome}
+      nil -> outcome
+    end
+  end
+
+  defp tag_unauthorized(outcome, _auth_headers), do: outcome
+
+  @doc false
+  # The caller options that domain modules forward to the transport.
+  @spec transport_opts(keyword()) :: keyword()
+  def transport_opts(opts), do: Keyword.take(opts, @transport_opts)
+
+  @doc false
+  # The transport option names every public function accepts.
+  @spec transport_keys() :: [atom()]
+  def transport_keys, do: @transport_opts
+
+  @doc false
+  @spec object_path(String.t(), String.t()) :: String.t()
+  def object_path(bucket, object), do: "/b/#{bucket}/o/#{encode_object(object)}"
+
+  @doc false
+  # Base URL of the API host for this call.
+  @spec base_url(keyword()) :: String.t()
+  def base_url(opts), do: Keyword.get(opts, :base_url) || Config.base_url()
 
   @doc """
   Percent-encodes an object name for use in a URL path (encodes `/` as `%2F`).
@@ -118,47 +227,216 @@ defmodule GcpGcs.Client do
     URI.encode(name, &URI.char_unreserved?/1)
   end
 
-  # Streaming internals --------------------------------------------------------
+  # Retries --------------------------------------------------------------------
 
-  # State: {phase, status, headers, user_acc, error_buffer}
-  defp stream_step({:status, status}, {_, _, _headers, acc, err}, _reducer) do
-    {phase(status), status, [], acc, err}
+  # `attempt` takes the bearer token the previous attempt was rejected with
+  # (nil otherwise) and returns an outcome: {:response, status, headers,
+  # payload}, {:unauthorized, sent_token, response_outcome},
+  # {:transport_error, reason, reducer_touched?} or {:error, %Error{}}.
+  #
+  # `auth` is `:fresh`, `{:stale, token}` (the attempt right after a 401) or
+  # `:reauthed` (later attempts: the token was already replaced once).
+  defp with_retries(method, opts, attempt) do
+    retry_loop(attempt, retry_policy(method, opts), 1, :fresh)
   end
 
-  defp stream_step({:headers, headers}, {phase, status, _, acc, err}, reducer) do
-    case phase do
-      :ok -> {:ok, status, headers, reducer.({:headers, headers}, acc), err}
-      :error -> {:error, status, headers, acc, err}
+  defp retry_loop(attempt, policy, n, auth) do
+    case attempt.(stale_token(auth)) do
+      {:unauthorized, sent_token, outcome} ->
+        # The token may have been revoked or rotated: retry once with
+        # another one. A second 401 is final.
+        if auth == :fresh,
+          do: retry_loop(attempt, policy, n, {:stale, sent_token}),
+          else: outcome
+
+      outcome ->
+        if retryable?(outcome) and policy != nil and n < policy[:max_attempts] do
+          Process.sleep(delay(outcome, policy, n))
+          retry_loop(attempt, policy, n + 1, after_attempt(auth))
+        else
+          outcome
+        end
     end
   end
 
-  defp stream_step({:data, data}, {:ok, status, headers, acc, err}, reducer) do
-    {:ok, status, headers, reducer.({:data, data}, acc), err}
+  defp stale_token({:stale, token}), do: token
+  defp stale_token(_auth), do: nil
+
+  defp after_attempt(:fresh), do: :fresh
+  defp after_attempt(_auth), do: :reauthed
+
+  defp retry_policy(method, opts) do
+    if method in [:get, :head] or Keyword.get(opts, :idempotent) == true,
+      do: retry_policy(opts),
+      else: nil
   end
 
-  defp stream_step({:data, data}, {:error, status, headers, acc, err}, _reducer) do
-    # Non-2xx: buffer the body (newest chunk first) so we can build a useful
-    # error. finish_stream/4 reverses before joining.
-    {:error, status, headers, acc, [data | err]}
+  @doc false
+  # The retry settings for a call (`nil` when retries are disabled), for
+  # callers that retry at a higher level (resumable uploads).
+  @spec retry_policy(keyword()) :: keyword() | nil
+  def retry_policy(opts) do
+    case Keyword.get(opts, :retry) do
+      false -> nil
+      overrides when is_list(overrides) -> Keyword.merge(Config.retry(), overrides)
+      _ -> Config.retry()
+    end
+  end
+
+  @doc false
+  # Whether a returned error is transient by the same rules as request retries.
+  @spec retryable_error?(Error.t()) :: boolean()
+  def retryable_error?(%Error{status: status}) when status in @retry_statuses, do: true
+
+  def retryable_error?(%Error{code: :connection_error, details: %{reason: reason}}),
+    do: reason in @retry_transport_reasons
+
+  def retryable_error?(%Error{}), do: false
+
+  @doc false
+  # Sleeps the backoff before attempt `n + 1`.
+  @spec backoff(keyword(), pos_integer()) :: :ok
+  def backoff(policy, n), do: Process.sleep(jitter(policy, n))
+
+  defp retryable?({:response, status, _headers, _payload}), do: status in @retry_statuses
+
+  defp retryable?({:transport_error, %{reason: reason}, false}),
+    do: reason in @retry_transport_reasons
+
+  defp retryable?(_outcome), do: false
+
+  # Full jitter: uniform in [0, min(max_delay, base_delay * 2^(n-1))].
+  defp delay({:response, _status, headers, _payload}, policy, n) do
+    case retry_after_ms(headers) do
+      nil -> jitter(policy, n)
+      ms -> min(ms, policy[:max_delay])
+    end
+  end
+
+  defp delay(_outcome, policy, n), do: jitter(policy, n)
+
+  defp jitter(policy, n) do
+    cap = min(policy[:max_delay], policy[:base_delay] * Integer.pow(2, n - 1))
+    if cap > 0, do: :rand.uniform(cap + 1) - 1, else: 0
+  end
+
+  defp retry_after_ms(headers) do
+    with {_, value} <- List.keyfind(headers, "retry-after", 0),
+         {seconds, ""} <- Integer.parse(String.trim(value)) do
+      seconds * 1000
+    else
+      _ -> nil
+    end
+  end
+
+  # Transport options ----------------------------------------------------------
+
+  defp finch(opts), do: Keyword.get(opts, :finch) || Config.finch_name()
+
+  # `|| default` (not Keyword.get/3 default) so an explicit `timeout: nil`
+  # from callers still resolves to the default rather than reaching Finch.
+  defp stream_opts(opts) do
+    [
+      receive_timeout: Keyword.get(opts, :timeout) || Config.default_timeout(),
+      pool_timeout: Keyword.get(opts, :pool_timeout) || Config.pool_timeout()
+    ]
+  end
+
+  defp request_opts(opts) do
+    stream_opts = stream_opts(opts)
+
+    Keyword.put(
+      stream_opts,
+      :request_timeout,
+      Keyword.get(opts, :request_timeout) || stream_opts[:receive_timeout]
+    )
+  end
+
+  # Finch *raises* when no pooled connection frees up within `:pool_timeout`:
+  # its HTTP/1 pool turns NimblePool's checkout exit into a plain RuntimeError
+  # with this message (finch 0.24 `Finch.HTTP1.Pool.request/6`). Only that
+  # error becomes a tuple; anything else is a bug and keeps propagating.
+  @checkout_timeout_message "Finch was unable to provide a connection within the timeout"
+
+  defp checkout_safe(request, fun) do
+    fun.(request)
+  rescue
+    e in RuntimeError ->
+      if String.starts_with?(e.message, @checkout_timeout_message) do
+        {:error,
+         Error.new(
+           :resource_exhausted,
+           "no pooled connection became available within the pool timeout",
+           :pool_timeout
+         )}
+      else
+        reraise e, __STACKTRACE__
+      end
+  end
+
+  # Streaming internals --------------------------------------------------------
+
+  defp stream_step({:status, status}, {_, _, _headers, acc, err}, _reducer) do
+    {:cont, {phase(status), status, [], acc, err}}
+  end
+
+  defp stream_step({:headers, headers}, {:ok, status, _, acc, err}, reducer) do
+    {instruction, acc} = reduce(reducer, {:headers, headers}, acc)
+    {instruction, {:ok, status, headers, acc, err}}
+  end
+
+  defp stream_step({:headers, headers}, {:error, status, _, acc, err}, _reducer) do
+    {:cont, {:error, status, headers, acc, err}}
+  end
+
+  defp stream_step({:data, data}, {:ok, status, headers, acc, err}, reducer) do
+    {instruction, acc} = reduce(reducer, {:data, data}, acc)
+    {instruction, {:ok, status, headers, acc, err}}
+  end
+
+  defp stream_step({:data, data}, {:error, status, headers, acc, {chunks, size}}, _reducer) do
+    # Non-2xx: buffer the body (newest chunk first) for the error, up to
+    # @max_error_body bytes; then stop reading.
+    room = @max_error_body - size
+
+    if byte_size(data) >= room do
+      {:halt,
+       {:error, status, headers, acc, {[binary_part(data, 0, room) | chunks], @max_error_body}}}
+    else
+      {:cont, {:error, status, headers, acc, {[data | chunks], size + byte_size(data)}}}
+    end
+  end
+
+  defp stream_step(_trailers, state, _reducer), do: {:cont, state}
+
+  defp reduce(reducer, event, acc) do
+    case reducer.(event, acc) do
+      {:cont, acc} -> {:cont, acc}
+      {:halt, acc} -> {:halt, acc}
+      acc -> {:cont, acc}
+    end
   end
 
   defp phase(status) when status in 200..299, do: :ok
   defp phase(_status), do: :error
 
-  defp finish_stream(status, headers, acc, _err) when status in 200..299 do
-    {:ok, {status, headers, acc}}
-  end
-
-  defp finish_stream(status, _headers, _acc, err_buf) do
-    body = err_buf |> Enum.reverse() |> IO.iodata_to_binary()
-    {:error, Error.from_response(status, decode_maybe_json(body))}
-  end
-
   # Request building -----------------------------------------------------------
 
-  defp auth_headers(opts) do
+  defp url("/" <> _ = path, opts) do
+    root =
+      case Keyword.get(opts, :api, :json) do
+        :json -> base_url(opts) <> "/storage/v1"
+        :upload -> base_url(opts) <> "/upload/storage/v1"
+      end
+
+    append_query(root <> path, Keyword.get(opts, :query))
+  end
+
+  defp url(absolute, opts), do: append_query(absolute, Keyword.get(opts, :query))
+
+  defp auth_headers(opts, stale_token) do
     if Keyword.get(opts, :auth, true) do
-      Auth.request_headers()
+      Auth.request_headers(opts, stale_token)
     else
       {:ok, []}
     end
@@ -197,19 +475,13 @@ defmodule GcpGcs.Client do
 
   # Response interpretation ----------------------------------------------------
 
-  defp interpret_json(%Finch.Response{status: status, body: body}) when status in 200..299 do
-    case body do
-      "" -> {:ok, %{}}
-      data -> {:ok, decode_maybe_json(data)}
-    end
-  end
+  defp expected?(status, nil), do: status in 200..299
+  defp expected?(status, expect), do: status in expect
 
-  defp interpret_json(%Finch.Response{status: status, body: body}) do
-    {:error, Error.from_response(status, decode_maybe_json(body))}
-  end
+  # An empty body decodes to `%{}`; a non-JSON body is returned as-is.
+  defp decode_body(""), do: %{}
 
-  # Finch response bodies are always binaries; callers never pass anything else.
-  defp decode_maybe_json(body) when is_binary(body) do
+  defp decode_body(body) when is_binary(body) do
     case JSON.decode(body) do
       {:ok, decoded} -> decoded
       {:error, _} -> body
