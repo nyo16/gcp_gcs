@@ -18,7 +18,7 @@ defmodule GcpGcs.Upload do
   Exposed through the top-level `GcpGcs` module.
   """
 
-  alias GcpGcs.{Client, Config, Error, Telemetry, Validation}
+  alias GcpGcs.{Client, Error, Telemetry, Validation}
 
   @default_content_type "application/octet-stream"
   # Resumable chunk sizes must be multiples of 256 KiB (except the final chunk).
@@ -86,8 +86,7 @@ defmodule GcpGcs.Upload do
       :upload,
       %{bucket: bucket, object: object, strategy: :resumable, source: path},
       fn ->
-        with {:ok, _} <- Validation.validate_bucket(bucket),
-             {:ok, _} <- Validation.validate_object(object),
+        with {:ok, _} <- Validation.validate_location(bucket, object),
              {:ok, %File.Stat{size: size}} <- stat(path) do
           opts = Keyword.put_new(opts, :content_type, content_type(object, opts))
           upload_file_body(bucket, object, path, size, opts)
@@ -112,8 +111,7 @@ defmodule GcpGcs.Upload do
           {:ok, map()} | {:error, Error.t()}
   def upload_stream(bucket, object, enum, opts \\ []) do
     Telemetry.span(:upload, %{bucket: bucket, object: object, strategy: :resumable}, fn ->
-      with {:ok, _} <- Validation.validate_bucket(bucket),
-           {:ok, _} <- Validation.validate_object(object),
+      with {:ok, _} <- Validation.validate_location(bucket, object),
            {:ok, _} <- Validation.validate_enumerable(enum, "source"),
            {:ok, session} <- start_resumable_upload(bucket, object, opts) do
         stream_to_session(session, enum, chunk_size(opts), opts)
@@ -145,15 +143,13 @@ defmodule GcpGcs.Upload do
   @spec start_resumable_upload(String.t(), String.t(), keyword()) ::
           {:ok, String.t()} | {:error, Error.t()}
   def start_resumable_upload(bucket, object, opts \\ []) do
-    with {:ok, _} <- Validation.validate_bucket(bucket),
-         {:ok, _} <- Validation.validate_object(object) do
+    with {:ok, _} <- Validation.validate_location(bucket, object) do
       do_start_resumable_upload(bucket, object, opts)
     end
   end
 
   defp do_start_resumable_upload(bucket, object, opts) do
-    url = Config.upload_base() <> "/b/#{bucket}/o"
-    query = compact(uploadType: "resumable", name: object, predefinedAcl: opts[:predefined_acl])
+    query = [uploadType: "resumable", name: object, predefinedAcl: opts[:predefined_acl]]
     ct = opts[:content_type] || @default_content_type
 
     # GCS returns 411 Length Required if the initiation POST has no
@@ -167,28 +163,16 @@ defmodule GcpGcs.Upload do
         attrs -> {{:json, attrs}, [{"x-upload-content-type", ct}]}
       end
 
-    headers = put_origin(headers, opts)
+    request_opts =
+      [api: :upload, query: query, headers: put_origin(headers, opts), body: body] ++
+        Client.transport_opts(opts)
 
-    case Client.raw_request(:post, url,
-           query: query,
-           headers: headers,
-           body: body,
-           timeout: opts[:timeout]
-         ) do
-      {:ok, %Finch.Response{status: status} = resp} when status in 200..299 ->
-        case location_header(resp.headers) do
-          nil ->
-            {:error, Error.new(:internal, "resumable upload session missing Location header")}
-
-          uri ->
-            {:ok, uri}
-        end
-
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        {:error, Error.from_response(status, decode_body(body))}
-
-      {:error, %Error{}} = error ->
-        error
+    with {:ok, _status, resp_headers, _body} <-
+           Client.exchange(:post, "/b/#{bucket}/o", request_opts) do
+      case header_value(resp_headers, "location") do
+        nil -> {:error, Error.new(:internal, "resumable upload session missing Location header")}
+        uri -> {:ok, uri}
+      end
     end
   end
 
@@ -226,34 +210,28 @@ defmodule GcpGcs.Upload do
   end
 
   defp do_upload_chunk(session_uri, data, offset, total, opts) do
-    headers = [{"content-range", content_range(offset, byte_size(data), total)}]
-    body = {:binary, data, @default_content_type}
+    request_opts =
+      [
+        headers: [{"content-range", content_range(offset, byte_size(data), total)}],
+        body: {:binary, data, @default_content_type},
+        # The session URI is the credential: no bearer token on session PUTs.
+        auth: false,
+        expect: [200, 201, 308]
+      ] ++ Client.transport_opts(opts)
 
-    case Client.raw_request(:put, session_uri,
-           headers: headers,
-           body: body,
-           auth: false,
-           timeout: opts[:timeout]
-         ) do
-      {:ok, %Finch.Response{status: status, body: body}} when status in [200, 201] ->
-        {:ok, decode_body(body)}
-
-      {:ok, %Finch.Response{status: 308} = resp} ->
-        case next_offset(resp.headers) do
+    case Client.exchange(:put, session_uri, request_opts) do
+      {:ok, 308, headers, _body} ->
+        case next_offset(headers) do
           {:ok, next} ->
             {:resume, next}
 
           :error ->
             {:error,
-             Error.new(
-               :internal,
-               "malformed Range header in resumable upload response",
-               resp.headers
-             )}
+             Error.new(:internal, "malformed Range header in resumable upload response", headers)}
         end
 
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        {:error, Error.from_response(status, decode_body(body))}
+      {:ok, _status, _headers, object} ->
+        {:ok, object}
 
       {:error, %Error{}} = error ->
         error
@@ -263,13 +241,16 @@ defmodule GcpGcs.Upload do
   # Private --------------------------------------------------------------------
 
   defp do_put_object(bucket, object, data, opts) do
-    with {:ok, _} <- Validation.validate_bucket(bucket),
-         {:ok, _} <- Validation.validate_object(object),
+    with {:ok, _} <- Validation.validate_location(bucket, object),
          {:ok, _} <- Validation.validate_binary(data, "data") do
-      url = Config.upload_base() <> "/b/#{bucket}/o"
-      query = compact(uploadType: "media", name: object, predefinedAcl: opts[:predefined_acl])
+      query = [uploadType: "media", name: object, predefinedAcl: opts[:predefined_acl]]
       ct = opts[:content_type] || @default_content_type
-      Client.request(:post, url, query: query, body: {:binary, data, ct}, timeout: opts[:timeout])
+
+      Client.request(
+        :post,
+        "/b/#{bucket}/o",
+        [api: :upload, query: query, body: {:binary, data, ct}] ++ Client.transport_opts(opts)
+      )
     end
   end
 
@@ -292,21 +273,12 @@ defmodule GcpGcs.Upload do
       ]
 
       # The session URI is the credential: no bearer token on the PUT.
-      case Client.raw_request(:put, session,
-             headers: headers,
-             body: body,
-             auth: false,
-             timeout: opts[:timeout]
-           ) do
-        {:ok, %Finch.Response{status: status, body: body}} when status in [200, 201] ->
-          {:ok, decode_body(body)}
-
-        {:ok, %Finch.Response{status: status, body: body}} ->
-          {:error, Error.from_response(status, decode_body(body))}
-
-        {:error, %Error{}} = error ->
-          error
-      end
+      Client.request(
+        :put,
+        session,
+        [headers: headers, body: body, auth: false, expect: [200, 201]] ++
+          Client.transport_opts(opts)
+      )
     end
   end
 
@@ -339,7 +311,7 @@ defmodule GcpGcs.Upload do
   defp flush_chunks(session, offset, buf, chunk, opts, stalled?) when byte_size(buf) >= chunk do
     <<piece::binary-size(^chunk), rest::binary>> = buf
 
-    case upload_chunk(session, piece, offset: offset, total: nil, timeout: opts[:timeout]) do
+    case upload_chunk(session, piece, [offset: offset, total: nil] ++ Client.transport_opts(opts)) do
       {:resume, next} ->
         with {:ok, unsent, stalled?} <- unsent_tail(piece, offset, next, stalled?) do
           flush_chunks(session, next, prepend(unsent, rest), chunk, opts, stalled?)
@@ -358,7 +330,7 @@ defmodule GcpGcs.Upload do
   defp finalize(session, offset, buf, opts, stalled? \\ false) do
     total = offset + byte_size(buf)
 
-    case upload_chunk(session, buf, offset: offset, total: total, timeout: opts[:timeout]) do
+    case upload_chunk(session, buf, [offset: offset, total: total] ++ Client.transport_opts(opts)) do
       {:ok, object} ->
         {:ok, object}
 
@@ -495,23 +467,10 @@ defmodule GcpGcs.Upload do
     Map.get(@content_types, ext, @default_content_type)
   end
 
-  defp location_header(headers), do: header_value(headers, "location")
-
   defp header_value(headers, name) do
     case Enum.find(headers, fn {k, _v} -> String.downcase(k) == name end) do
       {_k, value} -> value
       nil -> nil
     end
   end
-
-  defp decode_body(body) when is_binary(body) and body != "" do
-    case JSON.decode(body) do
-      {:ok, decoded} -> decoded
-      {:error, _} -> body
-    end
-  end
-
-  defp decode_body(_), do: %{}
-
-  defp compact(pairs), do: Enum.reject(pairs, fn {_k, v} -> is_nil(v) end)
 end

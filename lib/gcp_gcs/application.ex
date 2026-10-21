@@ -18,6 +18,7 @@ defmodule GcpGcs.Application do
 
   @impl true
   def start(_type, _args) do
+    _ = GcpGcs.Config.refresh()
     warn_if_emulator_mode()
 
     children = [

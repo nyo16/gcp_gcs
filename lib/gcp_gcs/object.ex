@@ -10,7 +10,7 @@ defmodule GcpGcs.Object do
   These functions are exposed through the top-level `GcpGcs` module.
   """
 
-  alias GcpGcs.{Client, Config, Error, Result, Telemetry, Validation}
+  alias GcpGcs.{Client, Error, Result, Telemetry, Validation}
 
   @doc """
   Gets an object's metadata (not its contents).
@@ -22,11 +22,12 @@ defmodule GcpGcs.Object do
   @spec get(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
   def get(bucket, object, opts \\ []) do
     Telemetry.span(:get_object, %{bucket: bucket, object: object}, fn ->
-      with {:ok, _} <- Validation.validate_bucket(bucket),
-           {:ok, _} <- Validation.validate_object(object) do
-        query = compact(generation: opts[:generation])
-
-        Client.request(:get, object_url(bucket, object), query: query, timeout: opts[:timeout])
+      with {:ok, _} <- Validation.validate_location(bucket, object) do
+        Client.request(
+          :get,
+          Client.object_path(bucket, object),
+          [query: [generation: opts[:generation]]] ++ Client.transport_opts(opts)
+        )
       end
     end)
   end
@@ -51,22 +52,18 @@ defmodule GcpGcs.Object do
   def list(bucket, opts \\ []) do
     Telemetry.span(:list_objects, %{bucket: bucket}, fn ->
       with {:ok, _} <- Validation.validate_bucket(bucket) do
-        query =
-          compact(
-            prefix: opts[:prefix],
-            delimiter: opts[:delimiter],
-            maxResults: opts[:page_size],
-            pageToken: opts[:page_token],
-            startOffset: opts[:start_offset],
-            endOffset: opts[:end_offset],
-            versions: opts[:versions]
-          )
+        query = [
+          prefix: opts[:prefix],
+          delimiter: opts[:delimiter],
+          maxResults: opts[:page_size],
+          pageToken: opts[:page_token],
+          startOffset: opts[:start_offset],
+          endOffset: opts[:end_offset],
+          versions: opts[:versions]
+        ]
 
         :get
-        |> Client.request(Config.json_base() <> "/b/#{bucket}/o",
-          query: query,
-          timeout: opts[:timeout]
-        )
+        |> Client.request("/b/#{bucket}/o", [query: query] ++ Client.transport_opts(opts))
         |> Result.list("items")
       end
     end)
@@ -76,12 +73,12 @@ defmodule GcpGcs.Object do
   @spec delete(String.t(), String.t(), keyword()) :: :ok | {:error, Error.t()}
   def delete(bucket, object, opts \\ []) do
     Telemetry.span(:delete_object, %{bucket: bucket, object: object}, fn ->
-      with {:ok, _} <- Validation.validate_bucket(bucket),
-           {:ok, _} <- Validation.validate_object(object) do
-        query = compact(generation: opts[:generation])
-
+      with {:ok, _} <- Validation.validate_location(bucket, object) do
         :delete
-        |> Client.request(object_url(bucket, object), query: query, timeout: opts[:timeout])
+        |> Client.request(
+          Client.object_path(bucket, object),
+          [query: [generation: opts[:generation]]] ++ Client.transport_opts(opts)
+        )
         |> Result.as_ok()
       end
     end)
@@ -95,12 +92,12 @@ defmodule GcpGcs.Object do
           {:ok, map()} | {:error, Error.t()}
   def update(bucket, object, attrs, opts \\ []) do
     Telemetry.span(:update_object, %{bucket: bucket, object: object}, fn ->
-      with {:ok, _} <- Validation.validate_bucket(bucket),
-           {:ok, _} <- Validation.validate_object(object),
+      with {:ok, _} <- Validation.validate_location(bucket, object),
            {:ok, _} <- Validation.validate_map(attrs, "attrs") do
-        Client.request(:patch, object_url(bucket, object),
-          body: {:json, attrs},
-          timeout: opts[:timeout]
+        Client.request(
+          :patch,
+          Client.object_path(bucket, object),
+          [body: {:json, attrs}] ++ Client.transport_opts(opts)
         )
       end
     end)
@@ -125,14 +122,17 @@ defmodule GcpGcs.Object do
     }
 
     Telemetry.span(:copy_object, meta, fn ->
-      with {:ok, _} <- Validation.validate_bucket(src_bucket),
-           {:ok, _} <- Validation.validate_object(src_object),
-           {:ok, _} <- Validation.validate_bucket(dst_bucket),
-           {:ok, _} <- Validation.validate_object(dst_object) do
-        url =
-          "#{object_url(src_bucket, src_object)}/copyTo/b/#{dst_bucket}/o/#{Client.encode_object(dst_object)}"
+      with {:ok, _} <- Validation.validate_location(src_bucket, src_object),
+           {:ok, _} <- Validation.validate_location(dst_bucket, dst_object) do
+        path =
+          Client.object_path(src_bucket, src_object) <>
+            "/copyTo" <> Client.object_path(dst_bucket, dst_object)
 
-        Client.request(:post, url, body: {:json, opts[:attrs] || %{}}, timeout: opts[:timeout])
+        Client.request(
+          :post,
+          path,
+          [body: {:json, opts[:attrs] || %{}}] ++ Client.transport_opts(opts)
+        )
       end
     end)
   end
@@ -150,16 +150,18 @@ defmodule GcpGcs.Object do
           {:ok, map()} | {:error, Error.t()}
   def compose(bucket, dest_object, sources, opts \\ []) do
     Telemetry.span(:compose_object, %{bucket: bucket, object: dest_object}, fn ->
-      with {:ok, _} <- Validation.validate_bucket(bucket),
-           {:ok, _} <- Validation.validate_object(dest_object),
+      with {:ok, _} <- Validation.validate_location(bucket, dest_object),
            {:ok, _} <- Validation.validate_source_objects(sources) do
         body = %{
           "sourceObjects" => Enum.map(sources, &normalize_source/1),
           "destination" => opts[:attrs] || %{}
         }
 
-        url = "#{object_url(bucket, dest_object)}/compose"
-        Client.request(:post, url, body: {:json, body}, timeout: opts[:timeout])
+        Client.request(
+          :post,
+          Client.object_path(bucket, dest_object) <> "/compose",
+          [body: {:json, body}] ++ Client.transport_opts(opts)
+        )
       end
     end)
   end
@@ -187,14 +189,13 @@ defmodule GcpGcs.Object do
     }
 
     Telemetry.span(:rewrite_object, meta, fn ->
-      with {:ok, _} <- Validation.validate_bucket(src_bucket),
-           {:ok, _} <- Validation.validate_object(src_object),
-           {:ok, _} <- Validation.validate_bucket(dst_bucket),
-           {:ok, _} <- Validation.validate_object(dst_object) do
-        url =
-          "#{object_url(src_bucket, src_object)}/rewriteTo/b/#{dst_bucket}/o/#{Client.encode_object(dst_object)}"
+      with {:ok, _} <- Validation.validate_location(src_bucket, src_object),
+           {:ok, _} <- Validation.validate_location(dst_bucket, dst_object) do
+        path =
+          Client.object_path(src_bucket, src_object) <>
+            "/rewriteTo" <> Client.object_path(dst_bucket, dst_object)
 
-        rewrite_loop(url, opts[:attrs] || %{}, opts, nil)
+        rewrite_loop(path, opts[:attrs] || %{}, opts, nil)
       end
     end)
   end
@@ -211,11 +212,13 @@ defmodule GcpGcs.Object do
       :move_object,
       %{bucket: bucket, src_object: src_object, dst_object: dst_object},
       fn ->
-        with {:ok, _} <- Validation.validate_bucket(bucket),
-             {:ok, _} <- Validation.validate_object(src_object),
+        with {:ok, _} <- Validation.validate_location(bucket, src_object),
              {:ok, _} <- Validation.validate_object(dst_object) do
-          url = "#{object_url(bucket, src_object)}/moveTo/o/#{Client.encode_object(dst_object)}"
-          Client.request(:post, url, timeout: opts[:timeout])
+          path =
+            Client.object_path(bucket, src_object) <>
+              "/moveTo/o/" <> Client.encode_object(dst_object)
+
+          Client.request(:post, path, Client.transport_opts(opts))
         end
       end
     )
@@ -223,15 +226,16 @@ defmodule GcpGcs.Object do
 
   # Private
 
-  defp rewrite_loop(url, attrs, opts, token) do
-    query = compact(rewriteToken: token, maxBytesRewrittenPerCall: opts[:max_bytes_per_call])
+  defp rewrite_loop(path, attrs, opts, token) do
+    query = [rewriteToken: token, maxBytesRewrittenPerCall: opts[:max_bytes_per_call]]
+    request_opts = [query: query, body: {:json, attrs}] ++ Client.transport_opts(opts)
 
-    case Client.request(:post, url, query: query, body: {:json, attrs}, timeout: opts[:timeout]) do
+    case Client.request(:post, path, request_opts) do
       {:ok, %{"done" => true, "resource" => resource}} ->
         {:ok, resource}
 
       {:ok, %{"rewriteToken" => next}} when is_binary(next) ->
-        rewrite_loop(url, attrs, opts, next)
+        rewrite_loop(path, attrs, opts, next)
 
       {:ok, %{"resource" => resource}} ->
         {:ok, resource}
@@ -244,12 +248,6 @@ defmodule GcpGcs.Object do
     end
   end
 
-  defp object_url(bucket, object) do
-    Config.json_base() <> "/b/#{bucket}/o/#{Client.encode_object(object)}"
-  end
-
   defp normalize_source(name) when is_binary(name), do: %{"name" => name}
   defp normalize_source(%{} = m), do: Map.new(m, fn {k, v} -> {to_string(k), v} end)
-
-  defp compact(pairs), do: Enum.reject(pairs, fn {_k, v} -> is_nil(v) end)
 end

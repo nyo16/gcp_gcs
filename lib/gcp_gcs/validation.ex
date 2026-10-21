@@ -78,6 +78,15 @@ defmodule GcpGcs.Validation do
     {:error, Error.new(:validation_error, "object name must be a string")}
   end
 
+  @doc "Validates a bucket/object pair."
+  @spec validate_location(term(), term()) :: {:ok, {String.t(), String.t()}} | {:error, Error.t()}
+  def validate_location(bucket, object) do
+    with {:ok, _} <- validate_bucket(bucket),
+         {:ok, _} <- validate_object(object) do
+      {:ok, {bucket, object}}
+    end
+  end
+
   @spec validate_binary(term(), String.t()) :: {:ok, binary()} | {:error, Error.t()}
   def validate_binary(data, _field) when is_binary(data), do: {:ok, data}
 

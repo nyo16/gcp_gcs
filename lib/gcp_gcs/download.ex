@@ -9,7 +9,7 @@ defmodule GcpGcs.Download do
   Exposed through the top-level `GcpGcs` module.
   """
 
-  alias GcpGcs.{Client, Config, Error, Telemetry, Validation}
+  alias GcpGcs.{Client, Error, Telemetry, Validation}
 
   @doc """
   Downloads an object and returns its full contents as a binary.
@@ -28,8 +28,7 @@ defmodule GcpGcs.Download do
   end
 
   defp do_download(bucket, object, opts) do
-    with {:ok, _} <- Validation.validate_bucket(bucket),
-         {:ok, _} <- Validation.validate_object(object) do
+    with {:ok, _} <- Validation.validate_location(bucket, object) do
       reducer = fn
         {:data, chunk}, acc -> [acc, chunk]
         _other, acc -> acc
@@ -63,8 +62,7 @@ defmodule GcpGcs.Download do
   defp do_download_to_file(bucket, object, path, opts) do
     part = path <> ".part"
 
-    with {:ok, _} <- Validation.validate_bucket(bucket),
-         {:ok, _} <- Validation.validate_object(object),
+    with {:ok, _} <- Validation.validate_location(bucket, object),
          {:ok, io} <- open_file(part) do
       result =
         try do
@@ -134,8 +132,7 @@ defmodule GcpGcs.Download do
   end
 
   defp do_stream(bucket, object, opts, acc, reducer) do
-    with {:ok, _} <- Validation.validate_bucket(bucket),
-         {:ok, _} <- Validation.validate_object(object),
+    with {:ok, _} <- Validation.validate_location(bucket, object),
          {:ok, _} <- Validation.validate_reducer(reducer) do
       case stream_media(bucket, object, opts, acc, reducer) do
         {:ok, {_status, _headers, final_acc}} -> {:ok, final_acc}
@@ -147,9 +144,15 @@ defmodule GcpGcs.Download do
   # Private
 
   defp stream_media(bucket, object, opts, acc, reducer) do
-    url = Config.json_base() <> "/b/#{bucket}/o/#{Client.encode_object(object)}"
-    query = compact(alt: "media", generation: opts[:generation])
-    Client.stream(:get, url, [query: query, timeout: opts[:timeout]], acc, reducer)
+    query = [alt: "media", generation: opts[:generation]]
+
+    Client.stream(
+      :get,
+      Client.object_path(bucket, object),
+      [query: query] ++ Client.transport_opts(opts),
+      acc,
+      reducer
+    )
   end
 
   defp open_file(path) do
@@ -161,6 +164,4 @@ defmodule GcpGcs.Download do
         {:error, Error.new(:io_error, "could not open #{path} for writing", reason)}
     end
   end
-
-  defp compact(pairs), do: Enum.reject(pairs, fn {_k, v} -> is_nil(v) end)
 end

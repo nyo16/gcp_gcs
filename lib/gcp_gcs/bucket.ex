@@ -10,7 +10,7 @@ defmodule GcpGcs.Bucket do
   there unless you need the focused namespace.
   """
 
-  alias GcpGcs.{Client, Config, Error, Result, Telemetry, Validation}
+  alias GcpGcs.{Client, Error, Result, Telemetry, Validation}
 
   @doc """
   Creates a bucket in `project_id`.
@@ -42,12 +42,12 @@ defmodule GcpGcs.Bucket do
         |> maybe_put("location", opts[:location])
         |> maybe_put("storageClass", opts[:storage_class])
 
-      query = compact(project: project_id, predefinedAcl: opts[:predefined_acl])
+      query = [project: project_id, predefinedAcl: opts[:predefined_acl]]
 
-      Client.request(:post, Config.json_base() <> "/b",
-        query: query,
-        body: {:json, body},
-        timeout: opts[:timeout]
+      Client.request(
+        :post,
+        "/b",
+        [query: query, body: {:json, body}] ++ Client.transport_opts(opts)
       )
     end
   end
@@ -57,7 +57,7 @@ defmodule GcpGcs.Bucket do
   def get(bucket, opts \\ []) do
     Telemetry.span(:get_bucket, %{bucket: bucket}, fn ->
       with {:ok, _} <- Validation.validate_bucket(bucket) do
-        Client.request(:get, Config.json_base() <> "/b/#{bucket}", timeout: opts[:timeout])
+        Client.request(:get, "/b/#{bucket}", Client.transport_opts(opts))
       end
     end)
   end
@@ -77,16 +77,15 @@ defmodule GcpGcs.Bucket do
   def list(project_id, opts \\ []) do
     Telemetry.span(:list_buckets, %{project_id: project_id}, fn ->
       with {:ok, _} <- Validation.validate_project_id(project_id) do
-        query =
-          compact(
-            project: project_id,
-            prefix: opts[:prefix],
-            maxResults: opts[:page_size],
-            pageToken: opts[:page_token]
-          )
+        query = [
+          project: project_id,
+          prefix: opts[:prefix],
+          maxResults: opts[:page_size],
+          pageToken: opts[:page_token]
+        ]
 
         :get
-        |> Client.request(Config.json_base() <> "/b", query: query, timeout: opts[:timeout])
+        |> Client.request("/b", [query: query] ++ Client.transport_opts(opts))
         |> Result.list("items")
       end
     end)
@@ -98,7 +97,7 @@ defmodule GcpGcs.Bucket do
     Telemetry.span(:delete_bucket, %{bucket: bucket}, fn ->
       with {:ok, _} <- Validation.validate_bucket(bucket) do
         :delete
-        |> Client.request(Config.json_base() <> "/b/#{bucket}", timeout: opts[:timeout])
+        |> Client.request("/b/#{bucket}", Client.transport_opts(opts))
         |> Result.as_ok()
       end
     end)
@@ -112,9 +111,10 @@ defmodule GcpGcs.Bucket do
     Telemetry.span(:update_bucket, %{bucket: bucket}, fn ->
       with {:ok, _} <- Validation.validate_bucket(bucket),
            {:ok, _} <- Validation.validate_map(attrs, "attrs") do
-        Client.request(:patch, Config.json_base() <> "/b/#{bucket}",
-          body: {:json, attrs},
-          timeout: opts[:timeout]
+        Client.request(
+          :patch,
+          "/b/#{bucket}",
+          [body: {:json, attrs}] ++ Client.transport_opts(opts)
         )
       end
     end)
@@ -124,6 +124,4 @@ defmodule GcpGcs.Bucket do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp compact(pairs), do: Enum.reject(pairs, fn {_k, v} -> is_nil(v) end)
 end

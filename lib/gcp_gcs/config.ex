@@ -65,27 +65,24 @@ defmodule GcpGcs.Config do
     Application.get_env(:gcp_gcs, :pool_timeout, @default_pool_timeout)
   end
 
+  # The endpoint is resolved from app env / STORAGE_EMULATOR_HOST once, at
+  # application start, and served from :persistent_term on every request.
+  @endpoint_key {__MODULE__, :endpoint}
+
   @doc """
-  The scheme/host/port the Finch pool should connect to.
+  The scheme/host/port requests go to (and the Finch pool connects to).
 
   Returns `{scheme, host, port}` where `scheme` is `:http` or `:https`.
   """
   @spec endpoint() :: {:http | :https, String.t(), pos_integer()}
   def endpoint do
-    case emulator() do
-      nil -> {:https, @prod_host, 443}
-      %{scheme: scheme, host: host, port: port} -> {scheme_atom(scheme), host, port}
-    end
+    %{scheme: scheme, host: host, port: port} = resolved()
+    {scheme, host, port}
   end
 
-  @doc "Base URL for the JSON API, e.g. `https://storage.googleapis.com`."
+  @doc "Base URL of the API host, e.g. `https://storage.googleapis.com`."
   @spec base_url() :: String.t()
-  def base_url do
-    case emulator() do
-      nil -> "https://#{@prod_host}"
-      %{scheme: scheme, host: host, port: port} -> "#{scheme}://#{host}:#{port}"
-    end
-  end
+  def base_url, do: resolved().base_url
 
   @doc "Base URL for JSON metadata operations, e.g. `.../storage/v1`."
   @spec json_base() :: String.t()
@@ -97,9 +94,51 @@ defmodule GcpGcs.Config do
 
   @doc "Whether an emulator is configured (auth is skipped when true)."
   @spec emulator?() :: boolean()
-  def emulator?, do: emulator() != nil
+  def emulator?, do: resolved().emulator?
 
   @doc false
+  # Re-resolves the endpoint from the current app env and environment
+  # variables. Called at application start; tests that change the emulator
+  # at runtime call it too.
+  @spec refresh() :: map()
+  def refresh do
+    endpoint = resolve_endpoint()
+    :persistent_term.put(@endpoint_key, endpoint)
+    endpoint
+  end
+
+  defp resolved do
+    case :persistent_term.get(@endpoint_key, nil) do
+      nil -> refresh()
+      endpoint -> endpoint
+    end
+  end
+
+  defp resolve_endpoint do
+    case emulator() do
+      nil ->
+        %{
+          scheme: :https,
+          host: @prod_host,
+          port: 443,
+          base_url: "https://#{@prod_host}",
+          emulator?: false
+        }
+
+      %{scheme: scheme, host: host, port: port} ->
+        %{
+          scheme: scheme_atom(scheme),
+          host: host,
+          port: port,
+          base_url: "#{scheme}://#{host}:#{port}",
+          emulator?: true
+        }
+    end
+  end
+
+  @doc false
+  # The emulator settings from app env or STORAGE_EMULATOR_HOST, read live
+  # (unlike the functions above). `nil` when no emulator is configured.
   @spec emulator() :: emulator() | nil
   def emulator do
     case Application.get_env(:gcp_gcs, :emulator) do
@@ -121,9 +160,17 @@ defmodule GcpGcs.Config do
       count: Keyword.get(finch, :pool_count, 1)
     ]
 
-    pool = pool ++ conn_opts(scheme)
-
-    [name: @finch_name, pools: %{"#{scheme}://#{host}:#{port}" => pool}]
+    # The :default entry covers origins other than the endpoint (e.g. a
+    # per-call base URL): it gets the same strict TLS settings, so an
+    # unmatched https origin never falls back to Finch's defaults. Finch drops
+    # TLS options for plain-http origins.
+    [
+      name: @finch_name,
+      pools: %{
+        :default => pool ++ conn_opts(:https),
+        "#{scheme}://#{host}:#{port}" => pool ++ conn_opts(scheme)
+      }
+    ]
   end
 
   # Strict TLS for HTTPS: verify the server certificate against the OS trust

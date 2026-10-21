@@ -2,21 +2,29 @@ defmodule GcpGcs.Client do
   @moduledoc """
   HTTP transport for the Google Cloud Storage JSON API.
 
-  Wraps `Finch` and handles authentication, query/body encoding, JSON
-  decoding, response streaming, and error normalization. Most users should
-  use the high-level `GcpGcs` API instead of calling this module directly.
+  Wraps `Finch` and handles URL building, authentication, query/body encoding,
+  JSON decoding, response streaming, and error normalization. Most users
+  should use the high-level `GcpGcs` API instead of calling this module
+  directly.
 
-  Three entry points:
+  Three entry points, sharing one response-interpretation path:
 
-    * `request/3` — JSON metadata operations (decodes the body, success = 2xx)
-    * `raw_request/3` — returns the raw response for any status (used by
-      resumable uploads, which rely on `308 Resume Incomplete`)
+    * `request/3` — JSON operations; success is any 2xx, returns the decoded body
+    * `exchange/3` — success is any status listed in `:expect` (e.g. `308`
+      for resumable uploads); returns status, headers and the decoded body
     * `stream/5` — streams the response body through a reducer (used by downloads)
+
+  `path` is either relative to the API root (`"/b/bucket/o"`, resolved against
+  the JSON or upload API with `api: :json | :upload`) or an absolute URL (a
+  resumable session URI).
   """
 
   alias GcpGcs.{Auth, Config, Error}
 
   @json_content_type "application/json; charset=UTF-8"
+
+  # Options domain modules forward from the caller to the transport.
+  @transport_opts [:timeout, :pool_timeout, :finch]
 
   @type method :: :get | :post | :put | :patch | :delete | :head
   @type body ::
@@ -24,12 +32,16 @@ defmodule GcpGcs.Client do
           | {:json, term()}
           | {:binary, binary(), String.t()}
           | {:stream, Enumerable.t(), String.t()}
+  @type headers :: [{String.t(), String.t()}]
 
   @doc """
-  Performs a JSON request and decodes the response body.
+  Performs a request and decodes the response body.
 
   ## Options
-  - `:query` — keyword list or map appended as the query string
+  - `:api` — `:json` (default) or `:upload`; which API root a relative path
+    is resolved against
+  - `:query` — keyword list or map appended as the query string (`nil`
+    values are dropped)
   - `:headers` — extra request headers (list of `{name, value}`)
   - `:body` — request body, see `t:body/0` (default `nil`)
   - `:auth` — set `false` to skip authentication (default `true`)
@@ -43,32 +55,30 @@ defmodule GcpGcs.Client do
   or `{:error, %GcpGcs.Error{}}`.
   """
   @spec request(method(), String.t(), keyword()) :: {:ok, term()} | {:error, Error.t()}
-  def request(method, url, opts \\ []) do
-    with {:ok, response} <- raw_request(method, url, opts) do
-      interpret_json(response)
+  def request(method, path, opts \\ []) do
+    with {:ok, _status, _headers, body} <- exchange(method, path, opts) do
+      {:ok, body}
     end
   end
 
   @doc """
-  Performs a request and returns the raw `%Finch.Response{}` for any HTTP status.
+  Performs a request and accepts the statuses listed in `:expect` (default:
+  any 2xx) as success.
 
-  Only transport and authentication failures produce `{:error, _}`; HTTP
-  statuses (including `4xx` and `308`) are returned as `{:ok, response}` so the
-  caller can interpret them (e.g. resumable upload chunking).
+  Takes the options of `request/3` plus `:expect`. Returns
+  `{:ok, status, headers, decoded_body}`; any other status becomes
+  `{:error, %GcpGcs.Error{}}`, as do transport and authentication failures.
   """
-  @spec raw_request(method(), String.t(), keyword()) ::
-          {:ok, Finch.Response.t()} | {:error, Error.t()}
-  def raw_request(method, url, opts \\ []) do
+  @spec exchange(method(), String.t(), keyword()) ::
+          {:ok, non_neg_integer(), headers(), term()} | {:error, Error.t()}
+  def exchange(method, path, opts \\ []) do
     with {:ok, auth_headers} <- auth_headers(opts),
          {body_iodata, body_headers} <- encode_body(Keyword.get(opts, :body)) do
       headers = auth_headers ++ body_headers ++ Keyword.get(opts, :headers, [])
-      full_url = append_query(url, Keyword.get(opts, :query))
+      request = Finch.build(method, url(path, opts), headers, body_iodata)
 
-      method
-      |> Finch.build(full_url, headers, body_iodata)
-      |> checkout_safe(&Finch.request(&1, finch(opts), finch_opts(opts)))
-      |> case do
-        {:ok, %Finch.Response{} = response} -> {:ok, response}
+      case checkout_safe(request, &Finch.request(&1, finch(opts), finch_opts(opts))) do
+        {:ok, %Finch.Response{} = response} -> interpret(response, Keyword.get(opts, :expect))
         {:error, %Error{}} = error -> error
         {:error, reason} -> {:error, Error.from_transport(reason)}
       end
@@ -78,24 +88,23 @@ defmodule GcpGcs.Client do
   @doc """
   Streams a response body through `reducer`, starting from `acc`.
 
-  `reducer` receives `{:status, integer}`, `{:headers, headers}`, and
-  `{:data, binary}` chunks (as `Finch.stream/5`). On a non-2xx status the body
-  is collected and returned as `{:error, %GcpGcs.Error{}}` instead.
+  `reducer` receives `{:headers, headers}` and `{:data, binary}` chunks. On a
+  non-2xx status the reducer is not called; the body is collected and
+  returned as `{:error, %GcpGcs.Error{}}` instead.
 
-  Returns `{:ok, {status, headers, acc}}` on success.
+  Takes the options of `request/3` (except `:body`). Returns
+  `{:ok, {status, headers, acc}}` on success.
   """
   @spec stream(method(), String.t(), keyword(), acc, (term(), acc -> acc)) ::
-          {:ok, {non_neg_integer(), list(), acc}} | {:error, Error.t()}
+          {:ok, {non_neg_integer(), headers(), acc}} | {:error, Error.t()}
         when acc: term()
-  def stream(method, url, opts, acc, reducer) when is_function(reducer, 2) do
+  def stream(method, path, opts, acc, reducer) when is_function(reducer, 2) do
     with {:ok, auth_headers} <- auth_headers(opts) do
       headers = auth_headers ++ Keyword.get(opts, :headers, [])
-      full_url = append_query(url, Keyword.get(opts, :query))
+      request = Finch.build(method, url(path, opts), headers)
 
       # Track status so we can divert the body into an error buffer on failure.
       init = {:status, nil, [], acc, []}
-
-      request = Finch.build(method, full_url, headers)
       step = &stream_step(&1, &2, reducer)
 
       case checkout_safe(request, &Finch.stream(&1, finch(opts), init, step, finch_opts(opts))) do
@@ -109,6 +118,23 @@ defmodule GcpGcs.Client do
           {:error, Error.from_transport(reason)}
       end
     end
+  end
+
+  @doc false
+  # The caller options that domain modules forward to the transport.
+  @spec transport_opts(keyword()) :: keyword()
+  def transport_opts(opts), do: Keyword.take(opts, @transport_opts)
+
+  @doc false
+  @spec object_path(String.t(), String.t()) :: String.t()
+  def object_path(bucket, object), do: "/b/#{bucket}/o/#{encode_object(object)}"
+
+  @doc """
+  Percent-encodes an object name for use in a URL path (encodes `/` as `%2F`).
+  """
+  @spec encode_object(String.t()) :: String.t()
+  def encode_object(name) when is_binary(name) do
+    URI.encode(name, &URI.char_unreserved?/1)
   end
 
   # Transport options ----------------------------------------------------------
@@ -146,14 +172,6 @@ defmodule GcpGcs.Client do
       end
   end
 
-  @doc """
-  Percent-encodes an object name for use in a URL path (encodes `/` as `%2F`).
-  """
-  @spec encode_object(String.t()) :: String.t()
-  def encode_object(name) when is_binary(name) do
-    URI.encode(name, &URI.char_unreserved?/1)
-  end
-
   # Streaming internals --------------------------------------------------------
 
   # State: {phase, status, headers, user_acc, error_buffer}
@@ -187,10 +205,22 @@ defmodule GcpGcs.Client do
 
   defp finish_stream(status, _headers, _acc, err_buf) do
     body = err_buf |> Enum.reverse() |> IO.iodata_to_binary()
-    {:error, Error.from_response(status, decode_maybe_json(body))}
+    {:error, Error.from_response(status, decode_body(body))}
   end
 
   # Request building -----------------------------------------------------------
+
+  defp url("/" <> _ = path, opts) do
+    root =
+      case Keyword.get(opts, :api, :json) do
+        :json -> Config.json_base()
+        :upload -> Config.upload_base()
+      end
+
+    append_query(root <> path, Keyword.get(opts, :query))
+  end
+
+  defp url(absolute, opts), do: append_query(absolute, Keyword.get(opts, :query))
 
   defp auth_headers(opts) do
     if Keyword.get(opts, :auth, true) do
@@ -233,19 +263,21 @@ defmodule GcpGcs.Client do
 
   # Response interpretation ----------------------------------------------------
 
-  defp interpret_json(%Finch.Response{status: status, body: body}) when status in 200..299 do
-    case body do
-      "" -> {:ok, %{}}
-      data -> {:ok, decode_maybe_json(data)}
+  defp interpret(%Finch.Response{status: status, headers: headers, body: body}, expect) do
+    if expected?(status, expect) do
+      {:ok, status, headers, decode_body(body)}
+    else
+      {:error, Error.from_response(status, decode_body(body))}
     end
   end
 
-  defp interpret_json(%Finch.Response{status: status, body: body}) do
-    {:error, Error.from_response(status, decode_maybe_json(body))}
-  end
+  defp expected?(status, nil), do: status in 200..299
+  defp expected?(status, expect), do: status in expect
 
-  # Finch response bodies are always binaries; callers never pass anything else.
-  defp decode_maybe_json(body) when is_binary(body) do
+  # An empty body decodes to `%{}`; a non-JSON body is returned as-is.
+  defp decode_body(""), do: %{}
+
+  defp decode_body(body) when is_binary(body) do
     case JSON.decode(body) do
       {:ok, decoded} -> decoded
       {:error, _} -> body
